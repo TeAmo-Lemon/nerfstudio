@@ -42,7 +42,7 @@ from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.configs.dataparser_configs import AnnotatedDataParserUnion
 from nerfstudio.data.datamanagers.base_datamanager import DataManager, DataManagerConfig, TDataset
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
-from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
+from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
 from nerfstudio.data.datasets.base_dataset import InputDataset
 from nerfstudio.data.utils.data_utils import identity_collate
 from nerfstudio.data.utils.dataloaders import ImageBatchStream, _undistort_image
@@ -53,7 +53,7 @@ from nerfstudio.utils.rich_utils import CONSOLE
 @dataclass
 class FullImageDatamanagerConfig(DataManagerConfig):
     _target: Type = field(default_factory=lambda: FullImageDatamanager)
-    dataparser: AnnotatedDataParserUnion = field(default_factory=NerfstudioDataParserConfig)
+    dataparser: AnnotatedDataParserUnion = field(default_factory=ColmapDataParserConfig)
     camera_res_scale_factor: float = 1.0
     """The scale factor for scaling spatial data such as images, mask, semantics
     along with relevant information about camera intrinsics
