@@ -96,7 +96,7 @@ class ColmapDataParserConfig(DataParserConfig):
     """Path to masks directory. If not set, masks are not loaded."""
     depths_path: Optional[Path] = None
     """Path to depth maps directory. If not set, depths are not loaded."""
-    colmap_path: Path = Path("colmap/sparse/0")
+    colmap_path: Path = Path("sparse/0")
     """Path to the colmap reconstruction directory relative to the data path."""
     load_3D_points: bool = True
     """Whether to load the 3D points from the colmap reconstruction. This is helpful for Gaussian splatting and
@@ -254,6 +254,11 @@ class ColmapDataParser(DataParser):
     def _generate_dataparser_outputs(self, split: str = "train", **kwargs):
         assert self.config.data.exists(), f"Data directory {self.config.data} does not exist."
         colmap_path = self.config.data / self.config.colmap_path
+        if not colmap_path.exists() and not self.config.colmap_path.is_absolute():
+            # Backward compatibility: support datasets that keep COLMAP files in data/colmap/sparse/0.
+            legacy_colmap_path = self.config.data / "colmap" / self.config.colmap_path
+            if legacy_colmap_path.exists():
+                colmap_path = legacy_colmap_path
         assert colmap_path.exists(), f"Colmap path {colmap_path} does not exist."
 
         meta = self._get_all_images_and_cameras(colmap_path)

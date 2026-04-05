@@ -14,9 +14,43 @@
 
 import json
 import os
+import subprocess
+import sys
 from typing import Literal
 
-from test_nerfacto_integration import run_command_with_console_output, run_ns_download_data
+
+def run_command_with_console_output(command, stop_on_output=None):
+    try:
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
+        assert process.stdout is not None
+
+        for line in process.stdout:
+            print(line, end="")
+            sys.stdout.flush()
+
+            if stop_on_output and stop_on_output in line:
+                print(f"\nDetected '{stop_on_output}'. Stopping the process.")
+                process.terminate()
+                break
+
+        return_code = process.wait()
+        if return_code != 0:
+            print(f"Command failed with return code {return_code}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+
+def run_ns_download_data(scene: Literal["poster", "dozer", "desolation"]):
+    command = f"ns-download-data nerfstudio --capture-name={scene}"
+    run_command_with_console_output(command)
 
 
 def run_ns_train_splatfacto(scene: Literal["poster", "dozer", "desolation"]):

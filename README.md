@@ -258,6 +258,42 @@ Each model contains many parameters that can be changed, too many to list here. 
 ns-train nerfacto --help
 ```
 
+### Splatfacto command flow and gaussian attributes
+
+For Gaussian Splatting workflows, it can be useful to know exactly where each CLI argument goes and where gaussian
+attributes are stored.
+
+Example command:
+
+```bash
+ns-train splatfacto --output-dir /path/to/output colmap --data /path/to/dataset
+```
+
+Argument routing:
+
+- `ns-train` selects the train entrypoint (`nerfstudio/scripts/train.py`).
+- `splatfacto` selects the base trainer/method config (`method_configs["splatfacto"]`).
+- `--output-dir ...` applies to the preceding `splatfacto` subcommand, so it sets `TrainerConfig.output_dir`.
+- `colmap` selects the dataparser subcommand (`ColmapDataParserConfig`).
+- `--data ...` applies to the preceding `colmap` subcommand, so it sets `ColmapDataParserConfig.data`.
+
+For COLMAP datasets, the default reconstruction path is `sparse/0` relative to `--data`.
+If `data/sparse/0` does not exist, nerfstudio also tries `data/colmap/sparse/0` for backward compatibility.
+
+Where gaussian attributes live:
+
+- Runtime (model parameters): stored in `SplatfactoModel.gauss_params` (`torch.nn.ParameterDict`) with keys:
+    `means`, `scales`, `quats`, `features_dc`, `features_rest`, `opacities`.
+- Optimizer groups: exposed through `get_gaussian_param_groups()` and then consumed by trainer optimizers.
+- Checkpoint file (`*.ckpt`): serialized under the pipeline state dict as
+    `_model.gauss_params.means`, `_model.gauss_params.scales`, `_model.gauss_params.quats`,
+    `_model.gauss_params.features_dc`, `_model.gauss_params.features_rest`, `_model.gauss_params.opacities`.
+
+Notes on representation:
+
+- `scales` are stored in log-space and converted with `exp` for rasterization.
+- `opacities` are stored in logit-space and converted with `sigmoid` for rasterization.
+
 ### Tensorboard / WandB / Viewer
 
 We support four different methods to track training progress, using the viewer[tensorboard](https://www.tensorflow.org/tensorboard), [Weights and Biases](https://wandb.ai/site), and ,[Comet](https://comet.com/?utm_source=nerf&utm_medium=referral&utm_content=github). You can specify which visualizer to use by appending `--vis {viewer, tensorboard, wandb, comet viewer+wandb, viewer+tensorboard, viewer+comet}` to the training command. Simultaneously utilizing the viewer alongside wandb or tensorboard may cause stuttering issues during evaluation steps. The viewer only works for methods that are fast (ie. nerfacto, instant-ngp), for slower methods like NeRF, use the other loggers.
