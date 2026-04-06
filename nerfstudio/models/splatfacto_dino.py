@@ -83,10 +83,10 @@ def get_viewmat(optimized_camera_to_world):
 
 
 @dataclass
-class SplatfactoModelConfig(ModelConfig):
-    """Splatfacto Model Config, nerfstudio's implementation of Gaussian Splatting"""
+class SplatfactoDinoModelConfig(ModelConfig):
+    """Splatfacto+DINO Model Config, nerfstudio's implementation of Gaussian Splatting with DINO distillation"""
 
-    _target: Type = field(default_factory=lambda: SplatfactoModel)
+    _target: Type = field(default_factory=lambda: SplatfactoDinoModel)
     warmup_length: int = 500
     """period of steps where refinement is turned off"""
     refine_every: int = 100
@@ -167,16 +167,30 @@ class SplatfactoModelConfig(ModelConfig):
     """Regularization term for opacity in MCMC strategy. Only enabled when using MCMC strategy"""
     mcmc_scale_reg: float = 0.01
     """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
+    enable_dino_distillation: bool = True
+    """If True, enable DINOv2-based feature distillation into per-gaussian semantic features."""
+    dino_model_name: str = "dinov2_vitl14"
+    """Torch Hub model name for DINOv2 backbone."""
+    dino_backbone_dim: int = 1024
+    """Feature channel count produced by the DINOv2 backbone before low-dimensional projection."""
+    dino_feature_dim: int = 16
+    """Low-dimensional semantic feature size stored per gaussian."""
+    dino_loss_mult: float = 0.1
+    """Loss weight for DINO feature distillation."""
+    dino_target_source: Literal["rendered", "ground_truth"] = "rendered"
+    """Source image used for DINO target features: rendered prediction or ground-truth image."""
+    dino_rgb_update_interval: int = 100
+    """How often (steps) to refresh the global PCA projection used to map 16D DINO vectors to RGB."""
 
 
-class SplatfactoModel(Model):
-    """Nerfstudio's implementation of Gaussian Splatting
+class SplatfactoDinoModel(Model):
+    """Nerfstudio's implementation of Gaussian Splatting with DINO distillation
 
     Args:
         config: Splatfacto configuration to instantiate model
     """
 
-    config: SplatfactoModelConfig
+    config: SplatfactoDinoModelConfig
 
     def __init__(
         self,
@@ -228,7 +242,46 @@ class SplatfactoModel(Model):
             "features_rest": features_rest,
             "opacities": opacities,
         }
+        if self.config.enable_dino_distillation:
+            gauss_params["features_dino"] = torch.nn.Parameter(torch.zeros((num_points, self.config.dino_feature_dim)))
         self.gauss_params = torch.nn.ParameterDict(gauss_params)
+
+        self._dino_backbone = None
+        self._dino_patch_size = 14
+        self._dino_cache: Dict[Tuple[int, int, int], torch.Tensor] = {}
+        self._current_cam_idx: Optional[int] = None
+        self.register_buffer(
+            "_dino_mean",
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_dino_std",
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_dino_rgb_mean",
+            torch.zeros(self.config.dino_feature_dim, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_dino_rgb_basis",
+            torch.zeros((self.config.dino_feature_dim, 3), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_dino_rgb_min",
+            torch.zeros(3, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_dino_rgb_scale",
+            torch.ones(3, dtype=torch.float32),
+            persistent=False,
+        )
+        self._dino_rgb_ready = False
+        self._dino_rgb_last_update_step = -1
 
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
@@ -340,6 +393,159 @@ class SplatfactoModel(Model):
     def opacities(self):
         return self.gauss_params["opacities"]
 
+    @property
+    def features_dino(self):
+        if "features_dino" not in self.gauss_params:
+            return None
+        return self.gauss_params["features_dino"]
+
+    def _ensure_dino_backbone(self) -> None:
+        if not self.config.enable_dino_distillation or self._dino_backbone is not None:
+            return
+        try:
+            backbone = torch.hub.load("facebookresearch/dinov2", self.config.dino_model_name, pretrained=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to load DINOv2 from torch hub. Check internet access and model name, "
+                "or disable dino distillation."
+            ) from exc
+
+        for param in backbone.parameters():
+            param.requires_grad_(False)
+        backbone.eval()
+        self._dino_backbone = backbone
+
+        patch_size = getattr(getattr(backbone, "patch_embed", None), "patch_size", 14)
+        if isinstance(patch_size, tuple):
+            patch_size = patch_size[0]
+        self._dino_patch_size = int(patch_size)
+
+    def _project_dino_tokens(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+        flat_tokens = patch_tokens.reshape(-1, patch_tokens.shape[-1])
+        if flat_tokens.shape[-1] > self.config.dino_backbone_dim:
+            flat_tokens = flat_tokens[:, : self.config.dino_backbone_dim]
+        elif flat_tokens.shape[-1] < self.config.dino_backbone_dim:
+            pad = self.config.dino_backbone_dim - flat_tokens.shape[-1]
+            flat_tokens = F.pad(flat_tokens, (0, pad), mode="constant", value=0.0)
+
+        # Use a low-rank PCA projection to distill high-dimensional DINO features into D dimensions.
+        q = min(self.config.dino_feature_dim, flat_tokens.shape[0], flat_tokens.shape[-1])
+        centered = flat_tokens - flat_tokens.mean(dim=0, keepdim=True)
+        _, _, v = torch.pca_lowrank(centered, q=q, niter=4)
+        reduced = centered @ v[:, :q]
+        if q < self.config.dino_feature_dim:
+            reduced = F.pad(reduced, (0, self.config.dino_feature_dim - q), mode="constant", value=0.0)
+        reduced = F.normalize(reduced, dim=-1, eps=1e-6)
+        return reduced.view(*patch_tokens.shape[:-1], self.config.dino_feature_dim)
+
+    def _extract_lowdim_dino_target(self, gt_img: torch.Tensor) -> torch.Tensor:
+        self._ensure_dino_backbone()
+        if self._dino_backbone is None:
+            raise RuntimeError("DINO backbone is not initialized.")
+
+        backbone = self._dino_backbone.to(self.device)
+        h, w = int(gt_img.shape[0]), int(gt_img.shape[1])
+        patch = max(1, self._dino_patch_size)
+        h_aligned = max(patch, (h // patch) * patch)
+        w_aligned = max(patch, (w // patch) * patch)
+
+        dino_in = gt_img.permute(2, 0, 1).unsqueeze(0)
+        if h_aligned != h or w_aligned != w:
+            dino_in = F.interpolate(dino_in, size=(h_aligned, w_aligned), mode="bilinear", align_corners=False)
+        dino_in = (dino_in - self._dino_mean.to(self.device)) / self._dino_std.to(self.device)
+
+        with torch.no_grad():
+            feats = backbone.forward_features(dino_in)
+
+        patch_tokens = None
+        if isinstance(feats, dict):
+            patch_tokens = feats.get("x_norm_patchtokens", None)
+            if patch_tokens is None:
+                patch_tokens = feats.get("x_prenorm", None)
+        elif isinstance(feats, torch.Tensor):
+            patch_tokens = feats
+        if patch_tokens is None:
+            raise RuntimeError("Could not parse patch tokens from DINOv2 output.")
+
+        if patch_tokens.ndim != 3:
+            raise RuntimeError(f"Unexpected DINO token shape: {tuple(patch_tokens.shape)}")
+
+        num_tokens = patch_tokens.shape[1]
+        h_tokens, w_tokens = h_aligned // patch, w_aligned // patch
+        if num_tokens == h_tokens * w_tokens + 1:
+            patch_tokens = patch_tokens[:, 1:, :]
+        if patch_tokens.shape[1] != h_tokens * w_tokens:
+            raise RuntimeError(
+                f"Patch token count mismatch, got {patch_tokens.shape[1]} tokens but expected {h_tokens * w_tokens}."
+            )
+
+        patch_tokens = patch_tokens.view(1, h_tokens, w_tokens, -1)
+        lowdim = self._project_dino_tokens(patch_tokens)
+        lowdim = lowdim.permute(0, 3, 1, 2)
+        lowdim = F.interpolate(lowdim, size=(h, w), mode="bilinear", align_corners=False)
+        return lowdim.squeeze(0).permute(1, 2, 0)
+
+    @torch.no_grad()
+    def _update_dino_rgb_projection(self) -> None:
+        if not self.config.enable_dino_distillation or "features_dino" not in self.gauss_params:
+            return
+
+        feats = self.features_dino.detach()
+        if feats.shape[0] == 0:
+            return
+        feats = F.normalize(feats, dim=-1, eps=1e-6)
+
+        # Subsample points to keep projection updates lightweight.
+        max_points = 8192
+        if feats.shape[0] > max_points:
+            idx = torch.randperm(feats.shape[0], device=feats.device)[:max_points]
+            feats = feats[idx]
+
+        mean = feats.mean(dim=0)
+        centered = feats - mean
+        q = min(3, centered.shape[0], centered.shape[1])
+
+        if q > 0:
+            _, _, v = torch.pca_lowrank(centered, q=q, niter=4)
+            basis = torch.zeros((centered.shape[1], 3), device=feats.device, dtype=feats.dtype)
+            basis[:, :q] = v[:, :q]
+        else:
+            basis = torch.zeros((centered.shape[1], 3), device=feats.device, dtype=feats.dtype)
+
+        projected = centered @ basis
+        mins = torch.quantile(projected, 0.01, dim=0)
+        maxs = torch.quantile(projected, 0.99, dim=0)
+        scale = (maxs - mins).clamp_min(1e-6)
+
+        self._dino_rgb_mean.copy_(mean.to(self._dino_rgb_mean.device, dtype=self._dino_rgb_mean.dtype))
+        self._dino_rgb_basis.copy_(basis.to(self._dino_rgb_basis.device, dtype=self._dino_rgb_basis.dtype))
+        self._dino_rgb_min.copy_(mins.to(self._dino_rgb_min.device, dtype=self._dino_rgb_min.dtype))
+        self._dino_rgb_scale.copy_(scale.to(self._dino_rgb_scale.device, dtype=self._dino_rgb_scale.dtype))
+        self._dino_rgb_ready = True
+        self._dino_rgb_last_update_step = self.step
+
+    @torch.no_grad()
+    def _dino_features_to_rgb(self, dino_features: torch.Tensor) -> torch.Tensor:
+        should_refresh = (
+            not self._dino_rgb_ready
+            or self.step - self._dino_rgb_last_update_step >= self.config.dino_rgb_update_interval
+        )
+        if should_refresh:
+            self._update_dino_rgb_projection()
+
+        if not self._dino_rgb_ready:
+            # Fallback: use first three channels if projection is unavailable.
+            raw = dino_features[..., :3]
+            raw = raw - raw.amin(dim=(-3, -2), keepdim=True)
+            raw = raw / (raw.amax(dim=(-3, -2), keepdim=True).clamp_min(1e-6))
+            return raw
+
+        normed = F.normalize(dino_features, dim=-1, eps=1e-6)
+        centered = normed - self._dino_rgb_mean
+        projected = centered @ self._dino_rgb_basis
+        rgb = (projected - self._dino_rgb_min) / self._dino_rgb_scale
+        return torch.clamp(rgb, 0.0, 1.0)
+
     def load_state_dict(self, dict, **kwargs):  # type: ignore
         # resize the parameters to match the new number of points
         self.step = 30000
@@ -347,9 +553,16 @@ class SplatfactoModel(Model):
             # For backwards compatibility, we remap the names of parameters from
             # means->gauss_params.means since old checkpoints have that format
             legacy_params = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+            if "features_dino" in self.gauss_params:
+                legacy_params.append("features_dino")
             for p in legacy_params:
                 dict[f"gauss_params.{p}"] = dict[p]
         newp = dict["gauss_params.means"].shape[0]
+        if "features_dino" in self.gauss_params and "gauss_params.features_dino" not in dict:
+            dict["gauss_params.features_dino"] = torch.zeros(
+                (newp, self.config.dino_feature_dim),
+                dtype=dict["gauss_params.means"].dtype,
+            )
         for name, param in self.gauss_params.items():
             old_shape = param.shape
             new_shape = (newp,) + old_shape[1:]
@@ -414,6 +627,8 @@ class SplatfactoModel(Model):
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
         # specify more if they want to add more optimizable params to gaussians.
         names = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        if self.config.enable_dino_distillation and "features_dino" in self.gauss_params:
+            names.append("features_dino")
         return {
             name: [self.gauss_params[name]]
             for name in names
@@ -501,8 +716,11 @@ class SplatfactoModel(Model):
         if self.training:
             assert camera.shape[0] == 1, "Only one camera at a time"
             optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
+            if camera.metadata is not None and "cam_idx" in camera.metadata:
+                self._current_cam_idx = int(camera.metadata["cam_idx"])
         else:
             optimized_camera_to_world = camera.camera_to_worlds
+            self._current_cam_idx = None
 
         # cropping
         if self.crop_box is not None and not self.training:
@@ -581,6 +799,29 @@ class SplatfactoModel(Model):
             )
         alpha = alpha[:, ...]
 
+        dino_render = None
+        if self.config.enable_dino_distillation and "features_dino" in self.gauss_params:
+            dino_features_crop = self.features_dino[crop_ids] if crop_ids is not None else self.features_dino
+            dino_render, _, _ = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
+                means=means_crop,
+                quats=quats_crop,
+                scales=torch.exp(scales_crop),
+                opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+                colors=dino_features_crop,
+                viewmats=viewmat,
+                Ks=K,
+                width=W,
+                height=H,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode="RGB",
+                sh_degree=None,
+                sparse_grad=False,
+                absgrad=self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
+                rasterize_mode=self.config.rasterize_mode,
+            )
+
         background = self._get_background_color()
         rgb = render[:, ..., :3] + (1 - alpha) * background
         rgb = torch.clamp(rgb, 0.0, 1.0)
@@ -605,6 +846,10 @@ class SplatfactoModel(Model):
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
         }
+        if dino_render is not None:
+            dino_features = dino_render.squeeze(0)
+            outputs["dino_features"] = dino_features
+            outputs["dino_rgb"] = self._dino_features_to_rgb(dino_features.detach())
         return outputs  # type: ignore
 
     def get_gt_img(self, image: torch.Tensor):
@@ -710,6 +955,27 @@ class SplatfactoModel(Model):
             self.camera_optimizer.get_loss_dict(loss_dict)
             if self.config.use_bilateral_grid:
                 loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
+
+            if self.config.enable_dino_distillation and "dino_features" in outputs:
+                cam_idx = self._current_cam_idx
+                dino_source_img = pred_img.detach() if self.config.dino_target_source == "rendered" else gt_img
+                cache_key = None
+                if self.config.dino_target_source == "ground_truth" and cam_idx is not None:
+                    cache_key = (cam_idx, int(gt_img.shape[0]), int(gt_img.shape[1]))
+                dino_target = None
+                if cache_key is not None and cache_key in self._dino_cache:
+                    dino_target = self._dino_cache[cache_key].to(self.device)
+                if dino_target is None:
+                    dino_target = self._extract_lowdim_dino_target(dino_source_img)
+                    if cache_key is not None:
+                        self._dino_cache[cache_key] = dino_target.detach().cpu()
+
+                dino_pred = outputs["dino_features"]
+                if mask is not None:
+                    dino_pred = dino_pred * mask
+                    dino_target = dino_target * mask
+                dino_feat_loss = F.mse_loss(dino_pred, dino_target)
+                loss_dict["dino_feat_loss"] = self.config.dino_loss_mult * dino_feat_loss
 
         return loss_dict
 

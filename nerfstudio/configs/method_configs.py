@@ -31,6 +31,7 @@ from nerfstudio.engine.optimizers import AdamOptimizerConfig
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.models.splatfacto import SplatfactoModelConfig
+from nerfstudio.models.splatfacto_dino import SplatfactoDinoModelConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.plugins.registry import discover_methods
 
@@ -112,8 +113,7 @@ method_configs["splatfacto-dino"] = TrainerConfig(
             dataparser=ColmapDataParserConfig(load_3D_points=True),
             cache_images_type="uint8",
         ),
-        model=SplatfactoModelConfig(
-            enable_dino_distillation=True,
+        model=SplatfactoDinoModelConfig(
             dino_feature_dim=16,
             dino_loss_mult=0.1,
         ),

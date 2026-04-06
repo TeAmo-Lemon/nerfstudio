@@ -1,0 +1,1 @@
+# HMGS configs module

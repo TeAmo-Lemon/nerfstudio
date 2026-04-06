@@ -65,7 +65,7 @@ class ExperimentConfig(InstantiateConfig):
     """Dictionary of optimizer groups and their schedulers"""
     vis: Literal[
         "viewer", "wandb", "tensorboard", "comet", "viewer+wandb", "viewer+tensorboard", "viewer+comet", "viewer_legacy"
-    ] = "wandb"
+    ] = "viewer"
     """Which visualizer to use."""
     data: Optional[Path] = None
     """Alias for --pipeline.datamanager.data"""
