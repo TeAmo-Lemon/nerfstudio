@@ -19,12 +19,11 @@ Put all the method implementations in one location.
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Dict, Union
+from typing import Dict
 
 import tyro
 
 from nerfstudio.configs.base_config import ViewerConfig
-from nerfstudio.configs.external_methods import ExternalMethodDummyTrainerConfig, get_external_methods
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig
 from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
 from nerfstudio.engine.optimizers import AdamOptimizerConfig
@@ -33,9 +32,8 @@ from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.models.splatfacto import SplatfactoModelConfig
 from nerfstudio.models.splatfacto_dino import SplatfactoDinoModelConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
-from nerfstudio.plugins.registry import discover_methods
 
-method_configs: Dict[str, Union[TrainerConfig, ExternalMethodDummyTrainerConfig]] = {}
+method_configs: Dict[str, TrainerConfig] = {}
 descriptions = {
     "splatfacto": "Gaussian Splatting model",
     "splatfacto-dino": "Gaussian Splatting model with DINOv2 feature distillation.",
@@ -313,14 +311,7 @@ def sort_methods(methods, method_descriptions):
 
 
 all_methods, all_descriptions = method_configs, descriptions
-# Add discovered external methods
-all_methods, all_descriptions = merge_methods(all_methods, all_descriptions, *discover_methods())
 all_methods, all_descriptions = sort_methods(all_methods, all_descriptions)
-
-# Register all possible external methods which can be installed with Nerfstudio
-all_methods, all_descriptions = merge_methods(
-    all_methods, all_descriptions, *sort_methods(*get_external_methods()), overwrite=False
-)
 
 AnnotatedBaseConfigUnion = tyro.conf.SuppressFixed[  # Don't show unparseable (fixed) arguments in helptext.
     tyro.conf.FlagConversionOff[
