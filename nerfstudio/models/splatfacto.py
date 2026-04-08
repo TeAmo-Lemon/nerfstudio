@@ -42,7 +42,6 @@ from nerfstudio.model_components.lib_bilagrid import BilateralGrid, color_correc
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.math import k_nearest_sklearn, random_quat_tensor
-from nerfstudio.utils.misc import torch_compile
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
 
@@ -63,10 +62,9 @@ def resize_image(image: torch.Tensor, d: int):
     return tf.conv2d(image.permute(2, 0, 1)[:, None, ...], weight, stride=d).squeeze(1).permute(1, 2, 0)
 
 
-@torch_compile()
 def get_viewmat(optimized_camera_to_world):
     """
-    function that converts c2w to gsplat world2camera matrix, using compile for some speed
+    Convert c2w to gsplat world2camera matrix.
     """
     R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
     T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
@@ -97,15 +95,15 @@ class SplatfactoModelConfig(ModelConfig):
     """Whether to randomize the background color."""
     num_downscales: int = 2
     """at the beginning, resolution is 1/2^d, where d is this number"""
-    cull_alpha_thresh: float = 0.1
+    cull_alpha_thresh: float = 0.005
     """threshold of opacity for culling gaussians. One can set it to a lower value (e.g. 0.005) for higher quality."""
-    cull_scale_thresh: float = 0.5
+    cull_scale_thresh: float = 0.1
     """threshold of scale for culling huge gaussians"""
     reset_alpha_every: int = 30
     """Every this many refinement steps, reset the alpha"""
-    densify_grad_thresh: float = 0.0008
+    densify_grad_thresh: float = 0.0002
     """threshold of positional gradient norm for densifying gaussians"""
-    use_absgrad: bool = True
+    use_absgrad: bool = False
     """Whether to use absgrad to densify gaussians, if False, will use grad rather than absgrad"""
     densify_size_thresh: float = 0.01
     """below this size, gaussians are *duplicated*, otherwise split"""
@@ -117,7 +115,7 @@ class SplatfactoModelConfig(ModelConfig):
     """if a gaussian is more than this percent of screen space, cull it"""
     split_screen_size: float = 0.05
     """if a gaussian is more than this percent of screen space, split it"""
-    stop_screen_size_at: int = 4000
+    stop_screen_size_at: int = 0
     """stop culling/splitting at this step WRT screen size of gaussians"""
     random_init: bool = False
     """whether to initialize the positions uniformly randomly (not SFM points)"""

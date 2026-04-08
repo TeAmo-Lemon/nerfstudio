@@ -248,21 +248,14 @@ class RenderStateMachine(threading.Thread):
         Args:
             outputs: the dictionary of outputs to choose from, from the model
         """
-        output_option_keys = [k for k in outputs.keys() if k != "dino_rgb"]
+        output_option_keys = list(outputs.keys())
         output_keys = set(output_option_keys)
         if self.output_keys != output_keys:
             self.output_keys = output_keys
             self.viewer.control_panel.update_output_options(output_option_keys)
 
-        def _resolve_view_tensor(output_name: str) -> torch.Tensor:
-            # dino_features is a high-dimensional semantic tensor. If the model provides
-            # an explicit RGB projection, prefer it for stable color semantics across views.
-            if output_name == "dino_features" and "dino_rgb" in outputs:
-                return outputs["dino_rgb"]
-            return outputs[output_name]
-
         output_render = self.viewer.control_panel.output_render
-        primary_output = _resolve_view_tensor(output_render)
+        primary_output = outputs[output_render]
         self.viewer.update_colormap_options(
             dimensions=primary_output.shape[-1], dtype=primary_output.dtype
         )
@@ -273,7 +266,7 @@ class RenderStateMachine(threading.Thread):
 
         if self.viewer.control_panel.split:
             split_output_render = self.viewer.control_panel.split_output_render
-            split_output_tensor = _resolve_view_tensor(split_output_render)
+            split_output_tensor = outputs[split_output_render]
             self.viewer.update_split_colormap_options(
                 dimensions=split_output_tensor.shape[-1], dtype=split_output_tensor.dtype
             )
