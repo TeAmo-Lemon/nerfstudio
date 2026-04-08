@@ -157,13 +157,13 @@ See [Installation](https://github.com/nerfstudio-project/nerfstudio/blob/main/do
 
 ## 2. Training your first model!
 
-The following will train a _nerfacto_ model, our recommended model for real world scenes.
+This repository is now trimmed down to a direct `Splatfacto` training flow launched with `python train.py`.
 
 ```bash
 # Download some test data:
 ns-download-data nerfstudio --capture-name=poster
-# Train model
-ns-train nerfacto --data data/nerfstudio/poster
+# Train Splatfacto
+python train.py -s data/nerfstudio/poster -m outputs/poster
 ```
 
 If everything works, you should see training progress like the following:
@@ -180,10 +180,11 @@ Navigating to the link at the end of the terminal will load the webviewer. If yo
 
 ### Resume from checkpoint / visualize existing run
 
-It is possible to load a pretrained model by running
+It is possible to resume a run by pointing `--load-checkpoint` at an existing checkpoint, or by using `--resume`
+to pick the latest checkpoint from the model directory.
 
 ```bash
-ns-train nerfacto --data data/nerfstudio/poster --load-dir {outputs/.../nerfstudio_models}
+python train.py -s data/nerfstudio/poster -m outputs/poster --resume
 ```
 
 ## Visualize existing run
@@ -240,22 +241,12 @@ Using an existing dataset is great, but likely you want to use your own data! We
 
 ## 5. Advanced Options
 
-### Training models other than nerfacto
-
-We provide other models than nerfacto, for example if you want to train the original nerf model, use the following command
-
-```bash
-ns-train vanilla-nerf --data DATA_PATH
-```
-
-For a full list of included models run `ns-train --help`.
-
 ### Modify Configuration
 
-Each model contains many parameters that can be changed, too many to list here. Use the `--help` command to see the full list of configuration options.
+Use `python train.py --help` to inspect the direct training arguments.
 
 ```bash
-ns-train nerfacto --help
+python train.py --help
 ```
 
 ### Splatfacto command flow and gaussian attributes
@@ -266,16 +257,16 @@ attributes are stored.
 Example command:
 
 ```bash
-ns-train splatfacto --output-dir /path/to/output colmap --data /path/to/dataset
+python train.py -s /path/to/dataset -m /path/to/output
 ```
 
 Argument routing:
 
-- `ns-train` selects the train entrypoint (`nerfstudio/scripts/train.py`).
-- `splatfacto` selects the base trainer/method config (`method_configs["splatfacto"]`).
-- `--output-dir ...` applies to the preceding `splatfacto` subcommand, so it sets `TrainerConfig.output_dir`.
-- `colmap` selects the dataparser subcommand (`ColmapDataParserConfig`).
-- `--data ...` applies to the preceding `colmap` subcommand, so it sets `ColmapDataParserConfig.data`.
+- `train.py` is the only training entrypoint.
+- `-s/--source-path` sets `ColmapDataParserConfig.data`.
+- `-m/--model-path` sets the run directory where `config.yml` and `nerfstudio_models/*.ckpt` are written.
+- The default runtime config is instantiated directly in `train.py` using `TrainerConfig`, `FullImageDatamanagerConfig`,
+  `ColmapDataParserConfig`, and `SplatfactoModelConfig`.
 
 For COLMAP datasets, the default reconstruction path is `sparse/0` relative to `--data`.
 If `data/sparse/0` does not exist, nerfstudio also tries `data/colmap/sparse/0` for backward compatibility.

@@ -40,7 +40,6 @@ from typing import (
 )
 
 import torch
-import tyro
 from torch.nn import Parameter
 from torch.utils.data.distributed import DistributedSampler
 from typing_extensions import TypeVar
@@ -49,7 +48,6 @@ from nerfstudio.cameras.camera_optimizers import CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.configs.base_config import InstantiateConfig
-from nerfstudio.configs.dataparser_configs import AnnotatedDataParserUnion
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
 from nerfstudio.data.datasets.base_dataset import InputDataset
@@ -282,7 +280,7 @@ class VanillaDataManagerConfig(DataManagerConfig):
 
     _target: Type = field(default_factory=lambda: VanillaDataManager)
     """Target class to instantiate."""
-    dataparser: AnnotatedDataParserUnion = field(default_factory=ColmapDataParserConfig)
+    dataparser: ColmapDataParserConfig = field(default_factory=ColmapDataParserConfig)
     """Specifies the dataparser used to unpack the data."""
     cache_images_type: Literal["uint8", "float32"] = "float32"
     """The image type returned from manager, caching images in uint8 saves memory"""
@@ -312,8 +310,7 @@ class VanillaDataManagerConfig(DataManagerConfig):
     patch_size: int = 1
     """Size of patch to sample from. If > 1, patch-based sampling will be used."""
 
-    # tyro.conf.Suppress prevents us from creating CLI arguments for this field.
-    camera_optimizer: tyro.conf.Suppress[Optional[CameraOptimizerConfig]] = field(default=None)
+    camera_optimizer: Optional[CameraOptimizerConfig] = field(default=None)
     """Deprecated, has been moved to the model config."""
     pixel_sampler: PixelSamplerConfig = field(default_factory=PixelSamplerConfig)
     """Specifies the pixel sampler used to sample pixels from images."""

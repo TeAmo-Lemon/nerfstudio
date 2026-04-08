@@ -26,7 +26,6 @@ from typing import Callable, Literal, Optional, Tuple
 import torch
 import yaml
 
-from nerfstudio.configs.method_configs import all_methods
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.pipelines.base_pipeline import Pipeline
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -90,16 +89,19 @@ def eval_setup(
     config = yaml.load(config_path.read_text(), Loader=yaml.Loader)
     assert isinstance(config, TrainerConfig)
 
-    config.pipeline.datamanager._target = all_methods[config.method_name].pipeline.datamanager._target
     if eval_num_rays_per_chunk:
         config.pipeline.model.eval_num_rays_per_chunk = eval_num_rays_per_chunk
 
     if update_config_callback is not None:
         config = update_config_callback(config)
 
-    # load checkpoints from wherever they were saved
-    # TODO: expose the ability to choose an arbitrary checkpoint
-    config.load_dir = config.get_checkpoint_dir()
+    # Support both the legacy nested Nerfstudio layout and the new direct train.py layout
+    # where `config.yml` lives next to `nerfstudio_models/`.
+    direct_checkpoint_dir = config_path.parent / config.relative_model_dir
+    if direct_checkpoint_dir.exists():
+        config.load_dir = direct_checkpoint_dir
+    else:
+        config.load_dir = config.get_checkpoint_dir()
 
     # setup pipeline (which includes the DataManager)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

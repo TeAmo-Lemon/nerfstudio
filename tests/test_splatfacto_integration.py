@@ -55,13 +55,13 @@ def run_ns_download_data(scene: Literal["poster", "dozer", "desolation"]):
 
 def run_ns_train_splatfacto(scene: Literal["poster", "dozer", "desolation"]):
     dataset_path = f"data/nerfstudio/{scene}"
-    command = f"ns-train splatfacto --data {dataset_path}"
+    output_path = f"outputs/{scene}"
+    command = f"python train.py -s {dataset_path} -m {output_path}"
     run_command_with_console_output(command, stop_on_output="Checkpoint Directory")
 
 
 def run_ns_eval(scene: Literal["poster", "dozer", "desolation"]):
-    timestamp = sorted(os.listdir(f"outputs/{scene}/splatfacto/"))[-1]
-    config_filename = f"outputs/{scene}/splatfacto/{timestamp}/config.yml"
+    config_filename = f"outputs/{scene}/config.yml"
     command = f"ns-eval --load-config {config_filename} --output-path splatfacto_integration_eval.json"
     run_command_with_console_output(command)
 

@@ -39,7 +39,6 @@ from torch.utils.data import DataLoader
 from typing_extensions import assert_never
 
 from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.configs.dataparser_configs import AnnotatedDataParserUnion
 from nerfstudio.data.datamanagers.base_datamanager import DataManager, DataManagerConfig, TDataset
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
@@ -53,7 +52,7 @@ from nerfstudio.utils.rich_utils import CONSOLE
 @dataclass
 class FullImageDatamanagerConfig(DataManagerConfig):
     _target: Type = field(default_factory=lambda: FullImageDatamanager)
-    dataparser: AnnotatedDataParserUnion = field(default_factory=ColmapDataParserConfig)
+    dataparser: ColmapDataParserConfig = field(default_factory=ColmapDataParserConfig)
     camera_res_scale_factor: float = 1.0
     """The scale factor for scaling spatial data such as images, mask, semantics
     along with relevant information about camera intrinsics

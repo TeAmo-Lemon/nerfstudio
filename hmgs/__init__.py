@@ -1,1 +1,0 @@
-"""Standalone HMGS project."""
