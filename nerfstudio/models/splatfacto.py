@@ -36,7 +36,6 @@ from torch.nn import Parameter
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
-from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.model_components.lib_bilagrid import BilateralGrid, color_correct, slice, total_variation_loss
 from nerfstudio.models.base_model import Model, ModelConfig
@@ -93,7 +92,7 @@ class SplatfactoModelConfig(ModelConfig):
     """training starts at 1/d resolution, every n steps this is doubled"""
     background_color: Literal["random", "black", "white"] = "random"
     """Whether to randomize the background color."""
-    num_downscales: int = 2
+    num_downscales: int = 1
     """at the beginning, resolution is 1/2^d, where d is this number"""
     cull_alpha_thresh: float = 0.005
     """threshold of opacity for culling gaussians. One can set it to a lower value (e.g. 0.005) for higher quality."""
@@ -361,9 +360,11 @@ class SplatfactoModel(Model):
         assert background_color.shape == (3,)
         self.background_color = background_color
 
-    def step_post_backward(self, step):
+    def finish_train_step(self, step):
+        # 训练反传和参数更新结束后，按当前策略执行后处理步骤。
         assert step == self.step
         if isinstance(self.strategy, DefaultStrategy):
+            # DefaultStrategy 需要在 backward 后执行 step_post_backward 来做 densify / prune。
             self.strategy.step_post_backward(
                 params=self.gauss_params,
                 optimizers=self.optimizers,
@@ -373,6 +374,7 @@ class SplatfactoModel(Model):
                 packed=False,
             )
         elif isinstance(self.strategy, MCMCStrategy):
+            # MCMCStrategy 也在这里做一步后的策略更新，并传入当前 means 学习率。
             self.strategy.step_post_backward(
                 params=self.gauss_params,
                 optimizers=self.optimizers,
@@ -384,26 +386,8 @@ class SplatfactoModel(Model):
         else:
             raise ValueError(f"Unknown strategy {self.strategy}")
 
-    def get_training_callbacks(
-        self, training_callback_attributes: TrainingCallbackAttributes
-    ) -> List[TrainingCallback]:
-        cbs = []
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
-                self.step_cb,
-                args=[training_callback_attributes.optimizers],
-            )
-        )
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                self.step_post_backward,
-            )
-        )
-        return cbs
-
-    def step_cb(self, optimizers: Optimizers, step):
+    def prepare_train_step(self, optimizers: Optimizers, step):
+        # 在每个训练步开始前缓存当前 step、optimizer 和 scheduler 句柄。
         self.step = step
         self.optimizers = optimizers.optimizers
         self.schedulers = optimizers.schedulers
@@ -636,17 +620,22 @@ class SplatfactoModel(Model):
             outputs: the output to compute loss dict to
             batch: ground truth batch corresponding to outputs
         """
+        # 先把 ground truth 按当前分辨率和背景色处理好，再和模型输出对齐比较。
         gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         metrics_dict = {}
         predicted_rgb = outputs["rgb"]
 
+        # 主指标是 PSNR，用来衡量渲染结果和真值图像的接近程度。
         metrics_dict["psnr"] = self.psnr(predicted_rgb, gt_rgb)
         if self.config.color_corrected_metrics:
+            # 需要时额外记录做过颜色校正后的 PSNR，便于观察色彩偏差。
             cc_rgb = color_correct(predicted_rgb, gt_rgb)
             metrics_dict["cc_psnr"] = self.psnr(cc_rgb, gt_rgb)
 
+        # 记录当前高斯数量，方便观察 densify / prune 过程。
         metrics_dict["gaussian_count"] = self.num_points
 
+        # 让相机优化器把自己的额外指标也写进去。
         self.camera_optimizer.get_metrics_dict(metrics_dict)
         return metrics_dict
 
@@ -658,6 +647,7 @@ class SplatfactoModel(Model):
             batch: ground truth batch corresponding to outputs
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
+        # 先得到和输出同尺度的真值图，再和预测图像一起参与损失计算。
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
         mask = None
@@ -675,6 +665,7 @@ class SplatfactoModel(Model):
         Ll1 = torch.abs(gt_img - pred_img).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
         if self.config.use_scale_regularization and self.step % 10 == 0:
+            # scale regularization 用来抑制高斯尺度比值过大，避免形状过度拉伸。
             scale_exp = torch.exp(self.scales)
             scale_reg = (
                 torch.maximum(
@@ -688,6 +679,7 @@ class SplatfactoModel(Model):
             scale_reg = torch.tensor(0.0).to(self.device)
 
         loss_dict = {
+            # 主损失由 L1 和 SSIM 共同组成，按配置权重混合。
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
             "scale_reg": scale_reg,
         }
@@ -695,6 +687,7 @@ class SplatfactoModel(Model):
         # Losses for mcmc
         if self.config.strategy == "mcmc":
             if self.config.mcmc_opacity_reg > 0.0:
+                # MCMC 模式下，对 opacity 做额外正则，避免权重过早塌缩。
                 mcmc_opacity_reg = (
                     self.config.mcmc_opacity_reg * torch.abs(torch.sigmoid(self.gauss_params["opacities"])).mean()
                 )

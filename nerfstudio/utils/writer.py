@@ -160,9 +160,13 @@ def put_time(name: str, duration: float, step: int, avg_over_steps: bool = True,
 @check_main_thread
 def write_out_storage():
     """Function that writes all the events in storage to all the writer locations"""
+    if not EVENT_STORAGE:
+        return
+
+    latest_step = EVENT_STORAGE[-1]["step"]
     for writer in EVENT_WRITERS:
-        if isinstance(writer, LocalWriter) and len(EVENT_STORAGE) > 0:
-            writer.write_stats_log(EVENT_STORAGE[0]["step"])
+        if isinstance(writer, LocalWriter):
+            writer.write_stats_log(latest_step)
             continue
         for event in EVENT_STORAGE:
             write_func = getattr(writer, event["write_type"].value)
@@ -387,15 +391,6 @@ class CometWriter(Writer):
         self.experiment.log_parameters(config_dict, step=step)
 
 
-def _cursorup(x: int):
-    """utility tool to move the cursor up on the terminal
-
-    Args:
-        x: amount of lines to move cursor upward
-    """
-    print(f"\r\033[{x}A", end="\x1b[1K\r")
-
-
 def _format_time(seconds):
     """utility tool to format time in human readable form given seconds"""
     ms = seconds % 1
@@ -418,118 +413,71 @@ def _format_time(seconds):
 
 @decorate_all([check_main_thread])
 class LocalWriter:
-    """Local Writer Class
-    TODO: migrate to prettyprint
-
-    Args:
-        config: configuration to instantiate class
-        banner_messages: list of messages to always display at bottom of screen
-    """
+    """Lightweight local writer that prints a single concise line per log step."""
 
     def __init__(self, config: cfg.LocalWriterConfig, banner_messages: Optional[List[str]] = None):
         self.config = config
         self.stats_to_track = [name.value for name in config.stats_to_track]
-        self.keys = set()
-        self.past_mssgs = ["", ""]
-        self.banner_len = 0 if banner_messages is None else len(banner_messages) + 1
         if banner_messages:
-            self.past_mssgs.extend(["-" * 100])
-            self.past_mssgs.extend(banner_messages)
-        self.has_printed = False
+            for message in banner_messages:
+                CONSOLE.log(message)
 
     def write_stats_log(self, step: int) -> None:
-        """Function to write out scalars to terminal
+        """Print a compact log line for the latest step."""
+        if step % GLOBAL_BUFFER["steps_per_log"] != 0:
+            return
 
-        Args:
-            step: current train step
-        """
-        valid_step = step % GLOBAL_BUFFER["steps_per_log"] == 0
-        if valid_step:
-            if not self.has_printed and self.config.max_log_size:
-                CONSOLE.log(
-                    f"Printing max of {self.config.max_log_size} lines. "
-                    "Set flag [yellow]--logging.local-writer.max-log-size=0[/yellow] "
-                    "to disable line wrapping."
-                )
-            latest_map, new_key = self._consolidate_events()
-            self._update_header(latest_map, new_key)
-            self._print_stats(latest_map)
+        latest_map = self._consolidate_events()
+        if not latest_map:
+            return
+
+        progress = 100.0 * step / max(1, GLOBAL_BUFFER["max_iter"])
+        parts = [f"step={step}", f"{progress:.1f}%"]
+        for name in self.stats_to_track:
+            if name not in latest_map:
+                continue
+            parts.append(f"{self._short_name(name)}={self._format_value(name, latest_map[name])}")
+        CONSOLE.log(" | ".join(parts))
 
     def write_config(self, name: str, config_dict: Dict[str, Any], step: int):
-        """Function that writes out the config to local
+        """Local writer does not emit configs to terminal."""
 
-        Args:
-            config: config dictionary to write out
-        """
-        # TODO: implement this
-
-    def _consolidate_events(self):
+    def _consolidate_events(self) -> Dict[str, Any]:
         latest_map = {}
-        new_key = False
         for event in EVENT_STORAGE:
-            name = event["name"]
-            if name not in self.keys:
-                self.keys.add(name)
-                new_key = True
-            latest_map[name] = event["event"]
-        return latest_map, new_key
+            latest_map[event["name"]] = event["event"]
+        return latest_map
 
-    def _update_header(self, latest_map, new_key):
-        """helper to handle the printing of the header labels
+    def _short_name(self, name: str) -> str:
+        aliases = {
+            EventName.ITER_TRAIN_TIME.value: "iter",
+            EventName.TRAIN_RAYS_PER_SEC.value: "train_rays/s",
+            EventName.VIS_RAYS_PER_SEC.value: "vis_rays/s",
+            EventName.TEST_RAYS_PER_SEC.value: "test_rays/s",
+            EventName.CURR_TEST_PSNR.value: "test_psnr",
+            EventName.ETA.value: "eta",
+            "Train Loss": "loss",
+            "PSNR": "psnr",
+            "Gaussian Count": "gaussians",
+            "GPU Memory (MB)": "gpu_mb",
+        }
+        return aliases.get(name, name)
 
-        Args:
-            latest_map: the most recent dictionary of stats that have been recorded
-            new_key: indicator whether or not there is a new key added to logger
-        """
-        full_log_cond = not self.config.max_log_size and GLOBAL_BUFFER["step"] <= GLOBAL_BUFFER["steps_per_log"]
-        capped_log_cond = self.config.max_log_size and (len(self.past_mssgs) - self.banner_len <= 2 or new_key)
-        if full_log_cond or capped_log_cond:
-            mssg = f"{'Step (% Done)':<20}"
-            for name, _ in latest_map.items():
-                if name in self.stats_to_track:
-                    mssg += f"{name:<20} "
-            self.past_mssgs[0] = mssg
-            self.past_mssgs[1] = "-" * len(mssg)
-            if full_log_cond or not self.has_printed:
-                print(mssg)
-                print("-" * len(mssg))
-
-    def _print_stats(self, latest_map, padding=" "):
-        """helper to print out the stats in a readable format
-
-        Args:
-            latest_map: the most recent dictionary of stats that have been recorded
-            padding: type of characters to print to pad open space
-        """
-        step = GLOBAL_BUFFER["step"]
-        fraction_done = step / GLOBAL_BUFFER["max_iter"]
-        curr_mssg = f"{step} ({fraction_done * 100:.02f}%)"
-        curr_mssg = f"{curr_mssg:<20}"
-        for name, v in latest_map.items():
-            if name in self.stats_to_track:
-                if "(time)" in name:
-                    v = _format_time(v)
-                elif "Rays" in name:
-                    v = human_format(v)
-                else:
-                    v = f"{v:0.4f}"
-                curr_mssg += f"{v:<20} "
-
-        # update the history buffer
-        if self.config.max_log_size:
-            if not self.has_printed:
-                cursor_idx = len(self.past_mssgs) - self.banner_len
-                self.has_printed = True
-            else:
-                cursor_idx = len(self.past_mssgs)
-            if len(self.past_mssgs[2:]) - self.banner_len >= self.config.max_log_size:
-                self.past_mssgs.pop(2)
-            self.past_mssgs.insert(len(self.past_mssgs) - self.banner_len, curr_mssg)
-            _cursorup(cursor_idx)
-
-            for i, mssg in enumerate(self.past_mssgs):
-                pad_len = len(max(self.past_mssgs, key=len))
-                style = "\x1b[30;42m" if self.banner_len and i >= len(self.past_mssgs) - self.banner_len + 1 else ""
-                print(f"{style}{mssg:{padding}<{pad_len}} \x1b[0m")
-        else:
-            print(curr_mssg)
+    def _format_value(self, name: str, value: Any) -> str:
+        if isinstance(value, torch.Tensor):
+            value = value.item()
+        if name == EventName.ETA.value:
+            if isinstance(value, str):
+                return value
+            return _format_time(float(value))
+        if "(time)" in name:
+            return _format_time(float(value))
+        if "Rays" in name:
+            return human_format(float(value))
+        if "Count" in name:
+            return str(int(value))
+        if "Memory" in name:
+            return f"{float(value):.0f}"
+        if isinstance(value, (int, float)):
+            return f"{float(value):.4f}"
+        return str(value)

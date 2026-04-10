@@ -10,7 +10,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple, cast
 
 import numpy as np
 import torch
@@ -18,13 +18,11 @@ import yaml
 from rich import box, style
 from rich.panel import Panel
 from rich.table import Table
-from torch import nn
 from torch.cuda.amp.grad_scaler import GradScaler
 
 from nerfstudio.configs.base_config import ViewerConfig
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanager, FullImageDatamanagerConfig
 from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
-from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import AdamOptimizerConfig, Optimizers
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.engine.trainer import TrainerConfig
@@ -46,27 +44,12 @@ class SessionState:
     training_state: Literal["training", "paused", "completed"] = "training"
 
 
-class DirectPipeline(nn.Module):
-    """Minimal pipeline wrapper used by the viewer and checkpoints."""
+@dataclass
+class DirectPipeline:
+    """Minimal object shared with the viewer."""
 
     datamanager: FullImageDatamanager
-    _model: SplatfactoModel
-
-    def __init__(self, datamanager: FullImageDatamanager, model: SplatfactoModel):
-        super().__init__()
-        self.datamanager = datamanager
-        self._model = model
-
-    @property
-    def model(self) -> SplatfactoModel:
-        return self._model
-
-    def load_pipeline(self, loaded_state: Dict[str, torch.Tensor], step: int) -> None:
-        state = {
-            (key[len("module.") :] if key.startswith("module.") else key): value for key, value in loaded_state.items()
-        }
-        self.model.update_to_step(step)
-        self.load_state_dict(state, strict=False)
+    model: SplatfactoModel
 
 
 def _parse_args() -> argparse.Namespace:
@@ -170,12 +153,21 @@ def _get_seed_points(datamanager: FullImageDatamanager) -> Optional[Tuple[torch.
 
 def _setup_pipeline(
     config: TrainerConfig, device: str, grad_scaler: GradScaler
-) -> Tuple[DirectPipeline, Optimizers, List[TrainingCallback]]:
-    datamanager = config.pipeline.datamanager.setup(device=device, test_mode="val", world_size=1, local_rank=0)
-    assert isinstance(datamanager, FullImageDatamanager)
+) -> Tuple[DirectPipeline, Optimizers]:
+    datamanager_config = cast(FullImageDatamanagerConfig, config.pipeline.datamanager)
+    model_config = cast(SplatfactoModelConfig, config.pipeline.model)
+
+    datamanager = FullImageDatamanager(
+        config=datamanager_config,
+        device=device,
+        test_mode="val",
+        world_size=1,
+        local_rank=0,
+    )
     assert datamanager.train_dataset is not None, "Missing train dataset."
 
-    model = config.pipeline.model.setup(
+    model = SplatfactoModel(
+        config=model_config,
         scene_box=datamanager.train_dataset.scene_box,
         num_train_data=len(datamanager.train_dataset),
         metadata=datamanager.train_dataset.metadata,
@@ -183,18 +175,30 @@ def _setup_pipeline(
         grad_scaler=grad_scaler,
         seed_points=_get_seed_points(datamanager),
     )
-    assert isinstance(model, SplatfactoModel)
     model.to(device)
 
     pipeline = DirectPipeline(datamanager=datamanager, model=model)
     param_groups = {**datamanager.get_param_groups(), **model.get_param_groups()}
     optimizers = Optimizers(config.optimizers.copy(), param_groups)
-    callbacks = datamanager.get_training_callbacks(
-        TrainingCallbackAttributes(optimizers=optimizers, grad_scaler=grad_scaler, pipeline=None, trainer=None)
-    ) + model.get_training_callbacks(
-        TrainingCallbackAttributes(optimizers=optimizers, grad_scaler=grad_scaler, pipeline=None, trainer=None)
-    )
-    return pipeline, optimizers, callbacks
+    return pipeline, optimizers
+
+
+def _pipeline_state_dict(model: SplatfactoModel) -> Dict[str, torch.Tensor]:
+    return {f"model.{key}": value for key, value in model.state_dict().items()}
+
+
+def _load_model_checkpoint(model: SplatfactoModel, loaded_state: Dict[str, torch.Tensor], step: int) -> None:
+    state = {}
+    for key, value in loaded_state.items():
+        if key.startswith("module."):
+            key = key[len("module.") :]
+        if key.startswith("_model."):
+            key = key[len("_model.") :]
+        elif key.startswith("model."):
+            key = key[len("model.") :]
+        state[key] = value
+    model.update_to_step(step)
+    model.load_state_dict(state, strict=False)
 
 
 def _setup_runtime_logging(config: TrainerConfig, output_dir: Path, banner_messages: Optional[List[str]]) -> None:
@@ -225,7 +229,7 @@ def _load_checkpoint(
 ) -> int:
     loaded_state = torch.load(checkpoint_path, map_location="cpu")
     start_step = loaded_state["step"] + 1
-    pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
+    _load_model_checkpoint(pipeline.model, loaded_state["pipeline"], loaded_state["step"])
     optimizers.load_optimizers(loaded_state["optimizers"])
     if "schedulers" in loaded_state:
         optimizers.load_schedulers(loaded_state["schedulers"])
@@ -247,7 +251,7 @@ def _save_checkpoint(
     torch.save(
         {
             "step": step,
-            "pipeline": pipeline.state_dict(),
+            "pipeline": _pipeline_state_dict(pipeline.model),
             "optimizers": {name: opt.state_dict() for name, opt in optimizers.optimizers.items()},
             "schedulers": {name: sch.state_dict() for name, sch in optimizers.schedulers.items()},
             "scalers": grad_scaler.state_dict(),
@@ -302,7 +306,6 @@ def _run_train_loop(
     checkpoint_dir: Path,
     pipeline: DirectPipeline,
     optimizers: Optimizers,
-    callbacks: List[TrainingCallback],
     grad_scaler: GradScaler,
     session_state: SessionState,
     viewer: Optional[Viewer],
@@ -311,21 +314,27 @@ def _run_train_loop(
 ) -> None:
     datamanager = pipeline.datamanager
     model = pipeline.model
+    # 训练开始前先保存数据解析器的相机变换，方便后续导出和复现。
     if hasattr(datamanager, "train_dataparser_outputs"):
         datamanager.train_dataparser_outputs.save_dataparser_transform(output_dir / "dataparser_transforms.json")
 
+    # 读取梯度累积配置；如果没有配置，就按每个参数组都不累积处理。
     gradient_accumulation_steps = config.gradient_accumulation_steps or {}
     with TimeWriter(writer, EventName.TOTAL_TRAIN_TIME):
+        # 主训练循环：从恢复步数开始，直到达到最大迭代次数。
         for step in range(start_step, config.max_num_iterations):
+            # 如果训练被暂停，就在这里等待恢复。
             while session_state.training_state == "paused":
                 time.sleep(0.01)
 
+            # 用锁保护训练与 viewer 之间共享状态，避免并发读写冲突。
             with train_lock:
                 with TimeWriter(writer, EventName.ITER_TRAIN_TIME, step=step) as train_t:
+                    # 切换到训练模式，并让模型根据当前步数更新内部状态。
                     model.train()
-                    for callback in callbacks:
-                        callback.run_callback_at_location(step, location=TrainingCallbackLocation.BEFORE_TRAIN_ITERATION)
+                    model.prepare_train_step(optimizers, step)
 
+                    # 需要清零梯度的参数组：到达累积周期起点时清一次。
                     needs_zero = [
                         group
                         for group in optimizers.parameters.keys()
@@ -333,6 +342,7 @@ def _run_train_loop(
                     ]
                     optimizers.zero_grad_some(needs_zero)
 
+                    # 前向与反向计算：根据设备类型选择 autocast 设备。
                     device_type = model.device.type
                     autocast_device = "cpu" if device_type == "mps" else device_type
                     with torch.autocast(device_type=autocast_device, enabled=config.mixed_precision):
@@ -340,10 +350,12 @@ def _run_train_loop(
                         outputs = model(camera)
                         metrics_dict = model.get_metrics_dict(outputs, batch)
                         loss_dict = model.get_loss_dict(outputs, batch, metrics_dict)
-                        loss = functools.reduce(torch.add, loss_dict.values())
+                        loss = sum(loss_dict.values())
 
+                    # 反向传播，把损失梯度传回模型参数。
                     grad_scaler.scale(loss).backward()  # type: ignore[arg-type]
 
+                    # 到达累积周期末尾时，执行优化器 step。
                     needs_step = [
                         group
                         for group in optimizers.parameters.keys()
@@ -351,14 +363,16 @@ def _run_train_loop(
                     ]
                     optimizers.optimizer_scaler_step_some(grad_scaler, needs_step)
 
+                    # 更新 GradScaler；如果没有发生溢出，再推进学习率调度器。
                     scale = grad_scaler.get_scale()
                     grad_scaler.update()
                     if scale <= grad_scaler.get_scale():
                         optimizers.scheduler_step_all(step)
 
-                    for callback in callbacks:
-                        callback.run_callback_at_location(step, location=TrainingCallbackLocation.AFTER_TRAIN_ITERATION)
+                    # 让模型完成这一轮训练后的收尾处理。
+                    model.finish_train_step(step)
 
+            # 统计训练速度，按帧/秒或射线/秒记录。
             if step > 1:
                 writer.put_time(
                     name=EventName.TRAIN_RAYS_PER_SEC,
@@ -367,13 +381,17 @@ def _run_train_loop(
                     avg_over_steps=True,
                 )
 
+            # 如果开启 viewer，则刷新当前场景显示。
             if viewer is not None:
                 viewer.update_scene(step, datamanager.get_train_rays_per_batch())
 
+            # 按日志周期记录训练损失和指标。
             if step_check(step, config.logging.steps_per_log, run_at_zero=True):
                 writer.put_scalar(name="Train Loss", scalar=loss, step=step)
-                writer.put_dict(name="Train Loss Dict", scalar_dict=loss_dict, step=step)
-                writer.put_dict(name="Train Metrics Dict", scalar_dict=metrics_dict, step=step)
+                if "psnr" in metrics_dict:
+                    writer.put_scalar(name="PSNR", scalar=metrics_dict["psnr"], step=step)
+                if "gaussian_count" in metrics_dict:
+                    writer.put_scalar(name="Gaussian Count", scalar=metrics_dict["gaussian_count"], step=step)
                 if torch.cuda.is_available():
                     writer.put_scalar(
                         name="GPU Memory (MB)",
@@ -381,6 +399,7 @@ def _run_train_loop(
                         step=step,
                     )
 
+            # 按保存周期写出 checkpoint。
             if step_check(step, config.steps_per_save):
                 _save_checkpoint(
                     pipeline=pipeline,
@@ -391,8 +410,10 @@ def _run_train_loop(
                     save_only_latest=config.save_only_latest_checkpoint,
                 )
 
+            # 将本轮写入的日志刷新到磁盘。
             writer.write_out_storage()
 
+    # 训练结束后更新状态并保存最终 checkpoint。
     session_state.training_state = "completed"
     _save_checkpoint(
         pipeline=pipeline,
@@ -402,11 +423,13 @@ def _run_train_loop(
         step=config.max_num_iterations - 1,
         save_only_latest=config.save_only_latest_checkpoint,
     )
+    # 输出最终训练总结信息。
     writer.write_out_storage()
     table = Table(title=None, show_header=False, box=box.MINIMAL, title_style=style.Style(bold=True))
     table.add_row("Config File", str(output_dir / "config.yml"))
     table.add_row("Checkpoint Directory", str(checkpoint_dir))
     CONSOLE.print(Panel(table, title="[bold][green]:tada: Training Finished :tada:[/bold]", expand=False))
+    # 如果 viewer 还在运行，就通知训练已完成；必要时保持进程不退出。
     if viewer is not None:
         viewer.training_complete()
         if not config.viewer.quit_on_train_completion:
@@ -439,7 +462,7 @@ def main() -> None:
         training_state="paused" if config.start_paused else "training",
     )
     grad_scaler = GradScaler(enabled=config.mixed_precision or config.use_grad_scaler)
-    pipeline, optimizers, callbacks = _setup_pipeline(config=config, device=device, grad_scaler=grad_scaler)
+    pipeline, optimizers = _setup_pipeline(config=config, device=device, grad_scaler=grad_scaler)
 
     viewer = _setup_viewer(
         config=config,
@@ -471,7 +494,6 @@ def main() -> None:
             checkpoint_dir=checkpoint_dir,
             pipeline=pipeline,
             optimizers=optimizers,
-            callbacks=callbacks,
             grad_scaler=grad_scaler,
             session_state=session_state,
             viewer=viewer,

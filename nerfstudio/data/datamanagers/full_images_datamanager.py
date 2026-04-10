@@ -153,12 +153,14 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         self.config.train_cameras_sampling_strategy"""
         num_train_cameras = len(self.train_dataset)
         if self.config.train_cameras_sampling_strategy == "random":
+            # 随机打乱所有训练相机，保证每轮都覆盖全部样本但顺序不同。
             if not hasattr(self, "random_generator"):
                 self.random_generator = random.Random(self.config.train_cameras_sampling_seed)
             indices = list(range(num_train_cameras))
             self.random_generator.shuffle(indices)
             return indices
         elif self.config.train_cameras_sampling_strategy == "fps":
+            # 使用最远点采样，让相近相机不要连续扎堆被采样，减少视角冗余。
             if not hasattr(self, "train_unsampled_epoch_count"):
                 np.random.seed(self.config.train_cameras_sampling_seed)  # fix random seed of fpsample
                 self.train_unsampled_epoch_count = np.zeros(num_train_cameras)
@@ -387,22 +389,25 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         Returns a Camera instead of raybundle"""
         self.train_count += 1
         if self.config.cache_images == "disk":
+            # 磁盘缓存模式下，每次直接从 ImageBatchStream 取一对相机和图像。
             camera, data = next(self.iter_train_image_dataloader)[0]
             camera = camera.to(self.device)
             data = get_dict_to_torch(data, self.device)
             return camera, data
 
+        # 非磁盘模式下，先从未见过的相机列表里弹出一个索引。
         image_idx = self.train_unseen_cameras.pop(0)
         # Make sure to re-populate the unseen cameras list if we have exhausted it
         if len(self.train_unseen_cameras) == 0:
             self.train_unseen_cameras = self.sample_train_cameras()
 
+        # 复制一份缓存数据，避免直接修改缓存对象本身。
         data = self.cached_train[image_idx]
-        # We're going to copy to make sure we don't mutate the cached dictionary.
-        # This can cause a memory leak: https://github.com/nerfstudio-project/nerfstudio/issues/3335
+        # 这里不能原地改缓存字典，否则会污染后续迭代并可能带来内存泄漏。
         data = data.copy()
         data["image"] = data["image"].to(self.device)
 
+        # 取出对应相机，并在 metadata 里记录相机索引，供后续 bilateral grid 等逻辑使用。
         assert len(self.train_cameras.shape) == 1, "Assumes single batch dimension"
         camera = self.train_cameras[image_idx : image_idx + 1].to(self.device)
         if camera.metadata is None:
@@ -415,11 +420,13 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         Returns a Camera instead of raybundle"""
         self.eval_count += 1
         if self.config.cache_images == "disk":
+            # 评估的磁盘缓存模式同训练一致，直接从 dataloader 取整图数据。
             camera, data = next(self.iter_eval_image_dataloader)[0]
             camera = camera.to(self.device)
             data = get_dict_to_torch(data, self.device)
             return camera, data
 
+        # 非磁盘模式下，交给 next_eval_image 做轮换采样。
         return self.next_eval_image(step=step)
 
     def next_eval_image(self, step: int) -> Tuple[Cameras, Dict]:
@@ -427,12 +434,15 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         Returns a Camera instead of raybundle
         TODO: Make sure this logic is consistent with the vanilladatamanager"""
         if self.config.cache_images == "disk":
+            # 这里保留与 next_eval 相同的磁盘读取路径。
             camera, data = next(self.iter_eval_image_dataloader)[0]
             return camera, data
+        # 评估时随机从未见过相机池中取一个，避免总是固定顺序。
         image_idx = self.eval_unseen_cameras.pop(random.randint(0, len(self.eval_unseen_cameras) - 1))
         # Make sure to re-populate the unseen cameras list if we have exhausted it
         if len(self.eval_unseen_cameras) == 0:
             self.eval_unseen_cameras = [i for i in range(len(self.eval_dataset))]
+        # 取出评估图像并搬到目标设备。
         data = self.cached_eval[image_idx]
         data = data.copy()
         data["image"] = data["image"].to(self.device)

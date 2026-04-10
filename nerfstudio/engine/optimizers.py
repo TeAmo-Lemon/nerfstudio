@@ -47,6 +47,7 @@ class OptimizerConfig(base_config.PrintableConfig):
     # but also not sure how to go about passing things into predefined torch objects.
     def setup(self, params) -> torch.optim.Optimizer:
         """Returns the instantiated object using the config."""
+        # 将 dataclass 配置转成 optimizer 构造参数，并实例化具体优化器。
         kwargs = vars(self).copy()
         kwargs.pop("_target")
         kwargs.pop("max_norm")
@@ -80,6 +81,7 @@ class Optimizers:
     """
 
     def __init__(self, config: Dict[str, Any], param_groups: Dict[str, List[Parameter]]) -> None:
+        # 统一管理：每个参数组对应一个 optimizer，且可选绑定一个 scheduler。
         self.config = config
         self.optimizers = {}
         self.schedulers = {}
@@ -120,6 +122,7 @@ class Optimizers:
         Args:
             param_group_name: name of optimizer to step forward
         """
+        # 对单个参数组执行一次 optimizer.step()。
         self.optimizers[param_group_name].step()
 
     def scheduler_step(self, param_group_name: str) -> None:
@@ -128,16 +131,19 @@ class Optimizers:
         Args:
             param_group_name: name of scheduler to step forward
         """
+        # 对单个参数组推进学习率调度器。
         if "scheduler" in self.config[param_group_name]:
             self.schedulers[param_group_name].step()
 
     def zero_grad_all(self) -> None:
         """Zero the gradients for all optimizer parameters."""
+        # 清空全部参数组对应 optimizer 的梯度缓存。
         for _, optimizer in self.optimizers.items():
             optimizer.zero_grad()
 
     def zero_grad_some(self, param_groups: List[str]) -> None:
         """Zero the gradients for the given parameter groups."""
+        # 仅清空指定参数组梯度，常用于梯度累积场景。
         for param_group in param_groups:
             optimizer = self.optimizers[param_group]
             optimizer.zero_grad()
@@ -148,6 +154,7 @@ class Optimizers:
         Args:
             grad_scaler: GradScaler to use
         """
+        # AMP 场景下，对全部参数组执行 unscale/裁剪/step。
         for param_group, optimizer in self.optimizers.items():
             max_norm = self.config[param_group]["optimizer"].max_norm
             if max_norm is not None:
@@ -162,6 +169,7 @@ class Optimizers:
         Args:
             grad_scaler: GradScaler to use
         """
+        # AMP 场景下，仅对指定参数组执行 unscale/裁剪/step。
         for param_group in param_groups:
             optimizer = self.optimizers[param_group]
             max_norm = self.config[param_group]["optimizer"].max_norm
@@ -173,6 +181,7 @@ class Optimizers:
 
     def optimizer_step_all(self) -> None:
         """Run step for all optimizers."""
+        # 非 AMP 路径：对所有参数组按需裁剪后执行 step。
         for param_group, optimizer in self.optimizers.items():
             # note that they key is the parameter name
             max_norm = self.config[param_group]["optimizer"].max_norm
@@ -186,6 +195,7 @@ class Optimizers:
         Args:
             step: the current step
         """
+        # 推进所有 scheduler，并把各参数组当前学习率写入日志。
         for param_group_name, scheduler in self.schedulers.items():
             scheduler.step()
             # TODO(ethan): clean this up. why is there indexing into a list?
@@ -198,6 +208,7 @@ class Optimizers:
         Args:
             loaded_state: the state from the previous checkpoint
         """
+        # 从 checkpoint 恢复各参数组 optimizer 的内部状态。
         for k, v in loaded_state.items():
             self.optimizers[k].load_state_dict(v)
 
@@ -207,5 +218,6 @@ class Optimizers:
         Args:
             loaded_state: the state from the previous checkpoint
         """
+        # 从 checkpoint 恢复各参数组 scheduler 的内部状态。
         for k, v in loaded_state.items():
             self.schedulers[k].load_state_dict(v)
