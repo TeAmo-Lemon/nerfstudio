@@ -10,7 +10,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Literal, Optional, Tuple, cast
+from typing import Any, Dict, List, Literal, Optional, Tuple, cast
 
 import numpy as np
 import torch
@@ -21,11 +21,14 @@ from rich.table import Table
 from torch.cuda.amp.grad_scaler import GradScaler
 
 from nerfstudio.configs.base_config import ViewerConfig
+from nerfstudio.data.datamanagers.dino_datamanager import DinoDatamanagerConfig
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanager, FullImageDatamanagerConfig
 from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
+from nerfstudio.data.datasets.dino_dataset import DinoInputDataset
 from nerfstudio.engine.optimizers import AdamOptimizerConfig, Optimizers
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.engine.trainer import TrainerConfig
+from nerfstudio.models.dino_splatfacto import DinoSplatfactoModelConfig
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.utils import profiler, writer
@@ -56,6 +59,12 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Direct Splatfacto training entrypoint.")
     parser.add_argument("-s", "--source-path", type=Path, required=True, help="COLMAP dataset root.")
     parser.add_argument("-m", "--model-path", type=Path, required=True, help="Output directory for config/checkpoints.")
+    parser.add_argument(
+        "--pipeline",
+        choices=["splatfacto", "dino-splatfacto"],
+        default="dino-splatfacto",
+        help="Pipeline to train.",
+    )
     parser.add_argument("--max-steps", type=int, default=30000, help="Number of training iterations.")
     parser.add_argument("--save-every", type=int, default=2000, help="Checkpoint period.")
     parser.add_argument("--eval-image-every", type=int, default=100, help="Eval image period.")
@@ -70,6 +79,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--steps-per-log", type=int, default=10, help="Scalar logging period.")
     parser.add_argument("--mixed-precision", action="store_true", help="Enable autocast/GradScaler.")
+    parser.add_argument(
+        "--dino-feature-dir",
+        type=Path,
+        default=None,
+        help="Directory containing precomputed DINO .pt features (defaults to <model-path>/dino_features).",
+    )
+    parser.add_argument("--dino-feature-dim", type=int, default=16, help="DINO feature channel count after PCA.")
+    parser.add_argument("--dino-loss-weight", type=float, default=0.05, help="Loss weight for DINO feature L1 loss.")
+    parser.add_argument(
+        "--dino-loss-start-step",
+        type=int,
+        default=3000,
+        help="Enable DINO feature loss from this global training step.",
+    )
     return parser.parse_args()
 
 
@@ -81,8 +104,70 @@ def _set_random_seed(seed: int) -> None:
 
 def _build_config(args: argparse.Namespace) -> TrainerConfig:
     viewer_config = ViewerConfig(num_rays_per_chunk=1 << 15, websocket_port=args.viewer_port)
+    use_dino_pipeline = args.pipeline == "dino-splatfacto"
+
+    if use_dino_pipeline:
+        dino_feature_dir = args.dino_feature_dir if args.dino_feature_dir is not None else args.model_path / "dino_features"
+        datamanager_config = DinoDatamanagerConfig(
+            dataparser=ColmapDataParserConfig(data=args.source_path, load_3D_points=True),
+            cache_images=args.data_device,
+            cache_images_type="uint8",
+            dino_features_dir=dino_feature_dir,
+            dino_feature_dim=args.dino_feature_dim,
+            strict_dino_loading=True,
+        )
+        model_config = DinoSplatfactoModelConfig(
+            dino_feature_dim=args.dino_feature_dim,
+            dino_loss_weight=args.dino_loss_weight,
+            dino_loss_start_step=args.dino_loss_start_step,
+        )
+        method_name = "dino-splatfacto"
+    else:
+        datamanager_config = FullImageDatamanagerConfig(
+            dataparser=ColmapDataParserConfig(data=args.source_path, load_3D_points=True),
+            cache_images=args.data_device,
+            cache_images_type="uint8",
+        )
+        model_config = SplatfactoModelConfig()
+        method_name = "splatfacto"
+
+    optimizers = {
+        "means": {
+            "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=1.6e-6, max_steps=args.max_steps),
+        },
+        "features_dc": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
+        "features_rest": {"optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15), "scheduler": None},
+        "opacities": {"optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15), "scheduler": None},
+        "scales": {"optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15), "scheduler": None},
+        "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
+        "camera_opt": {
+            "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(
+                lr_final=5e-7,
+                max_steps=args.max_steps,
+                warmup_steps=1000,
+                lr_pre_warmup=0,
+            ),
+        },
+        "bilateral_grid": {
+            "optimizer": AdamOptimizerConfig(lr=2e-3, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(
+                lr_final=1e-4,
+                max_steps=args.max_steps,
+                warmup_steps=1000,
+                lr_pre_warmup=0,
+            ),
+        },
+    }
+    if use_dino_pipeline:
+        optimizers["dino_features"] = {
+            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+            "scheduler": None,
+        }
+
     config = TrainerConfig(
-        method_name="splatfacto",
+        method_name=method_name,
         experiment_name=args.model_path.name,
         output_dir=args.model_path.parent,
         steps_per_eval_image=args.eval_image_every,
@@ -91,45 +176,10 @@ def _build_config(args: argparse.Namespace) -> TrainerConfig:
         steps_per_eval_all_images=args.eval_all_every,
         max_num_iterations=args.max_steps,
         mixed_precision=args.mixed_precision,
-        pipeline=VanillaPipelineConfig(
-            datamanager=FullImageDatamanagerConfig(
-                dataparser=ColmapDataParserConfig(data=args.source_path, load_3D_points=True),
-                cache_images=args.data_device,
-                cache_images_type="uint8",
-            ),
-            model=SplatfactoModelConfig(),
-        ),
-        optimizers={
-            "means": {
-                "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1.6e-6, max_steps=args.max_steps),
-            },
-            "features_dc": {"optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15), "scheduler": None},
-            "features_rest": {"optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15), "scheduler": None},
-            "opacities": {"optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15), "scheduler": None},
-            "scales": {"optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15), "scheduler": None},
-            "quats": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
-            "camera_opt": {
-                "optimizer": AdamOptimizerConfig(lr=1e-4, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=5e-7,
-                    max_steps=args.max_steps,
-                    warmup_steps=1000,
-                    lr_pre_warmup=0,
-                ),
-            },
-            "bilateral_grid": {
-                "optimizer": AdamOptimizerConfig(lr=2e-3, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=1e-4,
-                    max_steps=args.max_steps,
-                    warmup_steps=1000,
-                    lr_pre_warmup=0,
-                ),
-            },
-        },
+        pipeline=VanillaPipelineConfig(datamanager=datamanager_config, model=model_config),
+        optimizers=optimizers,
         viewer=viewer_config,
-        vis="none" if args.disable_viewer or args.vis == "none" else "viewer",
+        vis=cast(Any, "none" if args.disable_viewer or args.vis == "none" else "viewer"),
     )
     config.machine.seed = args.seed
     config.machine.device_type = args.device
@@ -144,6 +194,79 @@ def _save_config(config: TrainerConfig, output_dir: Path) -> None:
     config_path.write_text(yaml.dump(config), encoding="utf8")
 
 
+def _ensure_dino_features_ready(args: argparse.Namespace, pipeline: DirectPipeline) -> None:
+    """Auto-extract missing DINO features before viewer/train accesses the dataset."""
+    if args.pipeline != "dino-splatfacto":
+        return
+
+    train_dataset = pipeline.datamanager.train_dataset
+    eval_dataset = pipeline.datamanager.eval_dataset
+    if not isinstance(train_dataset, DinoInputDataset):
+        raise TypeError("DINO pipeline expects DinoInputDataset for train split")
+
+    datasets: List[DinoInputDataset] = [train_dataset]
+    if isinstance(eval_dataset, DinoInputDataset):
+        datasets.append(eval_dataset)
+
+    extraction_jobs: Dict[Tuple[Path, Path], List[Path]] = {}
+    for dataset in datasets:
+        job_key = (dataset.image_root.resolve(), dataset.feature_file_path().resolve())
+        extraction_jobs.setdefault(job_key, [])
+        missing_paths = dataset.missing_feature_image_paths()
+        extraction_jobs[job_key].extend(path.resolve() for path in missing_paths)
+
+    total_missing = sum(len(paths) for paths in extraction_jobs.values())
+    if total_missing == 0:
+        CONSOLE.log("DINO features already exist. Skipping extraction.")
+        return
+
+    from scripts.extract_dino_features import extract_dino_features_for_images
+
+    # Prefer the active training device so extraction can run on GPU when available.
+    device_type = pipeline.model.device.type
+    requested_device = device_type if device_type in {"cuda", "mps", "cpu"} else "cuda"
+
+    total_saved = 0
+    total_skipped = 0
+    for (image_root, output_file), image_paths in extraction_jobs.items():
+        unique_paths = sorted(set(image_paths))
+        if len(unique_paths) == 0:
+            continue
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        CONSOLE.log(
+            f"Auto-extracting missing DINO features: missing={len(unique_paths)}, "
+            f"image_root={image_root}, output_file={output_file}"
+        )
+        saved, skipped = extract_dino_features_for_images(
+            image_paths=unique_paths,
+            input_dir=image_root,
+            output_dir=output_file,
+            feature_dim=args.dino_feature_dim,
+            device=requested_device,
+            skip_existing=True,
+        )
+        total_saved += saved
+        total_skipped += skipped
+
+    for dataset in datasets:
+        dataset.invalidate_feature_cache()
+
+    still_missing: List[Path] = []
+    for dataset in datasets:
+        for missing_image_path in dataset.missing_feature_image_paths()[:5]:
+            still_missing.append(missing_image_path)
+        if len(still_missing) >= 5:
+            break
+
+    if len(still_missing) > 0:
+        raise RuntimeError(
+            "DINO feature auto-extraction completed but some feature files are still missing. "
+            f"Example missing files: {still_missing}"
+        )
+
+    CONSOLE.log(f"DINO feature auto-extraction finished. saved={total_saved}, skipped={total_skipped}")
+
+
 def _get_seed_points(datamanager: FullImageDatamanager) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     metadata = getattr(datamanager.train_dataparser_outputs, "metadata", {})
     if "points3D_xyz" not in metadata:
@@ -154,26 +277,27 @@ def _get_seed_points(datamanager: FullImageDatamanager) -> Optional[Tuple[torch.
 def _setup_pipeline(
     config: TrainerConfig, device: str, grad_scaler: GradScaler
 ) -> Tuple[DirectPipeline, Optimizers]:
-    datamanager_config = cast(FullImageDatamanagerConfig, config.pipeline.datamanager)
-    model_config = cast(SplatfactoModelConfig, config.pipeline.model)
-
-    datamanager = FullImageDatamanager(
-        config=datamanager_config,
-        device=device,
-        test_mode="val",
-        world_size=1,
-        local_rank=0,
+    datamanager = cast(
+        FullImageDatamanager,
+        config.pipeline.datamanager.setup(
+            device=device,
+            test_mode="val",
+            world_size=1,
+            local_rank=0,
+        ),
     )
     assert datamanager.train_dataset is not None, "Missing train dataset."
 
-    model = SplatfactoModel(
-        config=model_config,
-        scene_box=datamanager.train_dataset.scene_box,
-        num_train_data=len(datamanager.train_dataset),
-        metadata=datamanager.train_dataset.metadata,
-        device=device,
-        grad_scaler=grad_scaler,
-        seed_points=_get_seed_points(datamanager),
+    model = cast(
+        SplatfactoModel,
+        config.pipeline.model.setup(
+            scene_box=datamanager.train_dataset.scene_box,
+            num_train_data=len(datamanager.train_dataset),
+            metadata=datamanager.train_dataset.metadata,
+            device=device,
+            grad_scaler=grad_scaler,
+            seed_points=_get_seed_points(datamanager),
+        ),
     )
     model.to(device)
 
@@ -287,8 +411,8 @@ def _setup_viewer(
         config.viewer,
         log_filename=viewer_log_path,
         datapath=source_path,
-        pipeline=pipeline,
-        trainer=session_state,
+        pipeline=cast(Any, pipeline),
+        trainer=cast(Any, session_state),
         train_lock=train_lock,
         share=config.viewer.make_share_url,
     )
@@ -463,6 +587,7 @@ def main() -> None:
     )
     grad_scaler = GradScaler(enabled=config.mixed_precision or config.use_grad_scaler)
     pipeline, optimizers = _setup_pipeline(config=config, device=device, grad_scaler=grad_scaler)
+    _ensure_dino_features_ready(args=args, pipeline=pipeline)
 
     viewer = _setup_viewer(
         config=config,
