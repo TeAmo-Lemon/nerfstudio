@@ -77,11 +77,13 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.scene_box = scene_box
+        # 保存场景与训练集信息，供后续渲染、优化和评估流程使用。
         self.render_aabb: Optional[SceneBox] = None  # the box that we want to render - should be a subset of scene_box
         self.num_train_data = num_train_data
         self.kwargs = kwargs
         self.collider = None
 
+        # 子类在这里完成内部模块、参数和策略的初始化。
         self.populate_modules()  # populate the modules
         self.callbacks = None
         # to keep track of which device the nn.Module is on
@@ -103,6 +105,7 @@ class Model(nn.Module):
         # default instantiates optional modules that are common among many networks
         # NOTE: call `super().populate_modules()` in subclasses
 
+        # 通用基础能力：按配置创建场景裁剪器，先过滤不需要参与渲染的射线。
         if self.config.enable_collider:
             assert self.config.collider_params is not None
             self.collider = NearFarCollider(
@@ -137,6 +140,7 @@ class Model(nn.Module):
             ray_bundle: containing all the information needed to render that ray latents included
         """
 
+        # forward 只负责统一调度：先做 collider 预处理，再交给子类实现的 get_outputs。
         if self.collider is not None:
             ray_bundle = self.collider(ray_bundle)
 
@@ -150,6 +154,7 @@ class Model(nn.Module):
             batch: ground truth batch corresponding to outputs
         """
 
+        # 默认不计算额外指标，具体模型按自己的输出与 batch 结构补充。
         return {}
 
     @abstractmethod
@@ -170,6 +175,7 @@ class Model(nn.Module):
         Args:
             camera: generates raybundle
         """
+        # 评估阶段的标准入口：先由相机生成射线，再走分块渲染，避免一次性占满显存。
         return self.get_outputs_for_camera_ray_bundle(
             camera.generate_rays(camera_indices=0, keep_shape=True, obb_box=obb_box)
         )
@@ -181,6 +187,7 @@ class Model(nn.Module):
         Args:
             camera_ray_bundle: ray bundle to calculate outputs over
         """
+        # 按块渲染整张图：切分 ray bundle -> forward -> 拼回 HxW 输出。
         input_device = camera_ray_bundle.directions.device
         num_rays_per_chunk = self.config.eval_num_rays_per_chunk
         image_height, image_width = camera_ray_bundle.origins.shape[:2]
@@ -240,6 +247,7 @@ class Model(nn.Module):
         Returns:
             A dictionary of metrics.
         """
+        # 测试/可视化阶段用：返回标量指标和需要写盘的图像。
 
     def load_model(self, loaded_state: Dict[str, Any]) -> None:
         """Load the checkpoint from the given path

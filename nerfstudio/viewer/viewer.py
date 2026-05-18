@@ -20,7 +20,7 @@ import contextlib
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, cast
 
 import numpy as np
 import torch
@@ -207,6 +207,15 @@ class Viewer:
                 self._output_split_type_change,
                 default_composite_depth=self.config.default_composite_depth,
             )
+            self.semgeo_cluster_toggle = None
+            if hasattr(pipeline.model, "get_cluster_visualization_state"):
+                with self.viser_server.gui.add_folder("SemGeo"):
+                    self.semgeo_cluster_toggle = self.viser_server.gui.add_checkbox(
+                        "Show 3D Clusters",
+                        False,
+                        hint="Display the latest 3D semantic clustering as a colored point cloud.",
+                    )
+                    self.semgeo_cluster_toggle.on_update(lambda _: self._set_semgeo_cluster_visibility())
         config_path = self.log_filename.parents[0] / "config.yml"
         with tabs.add_tab("Render", viser.Icon.CAMERA):
             self.render_tab_state = populate_render_tab(
@@ -288,6 +297,9 @@ class Viewer:
                 point_shape="circle",
                 visible=False,  # Hidden by default.
             )
+        self.semgeo_cluster_handle = None
+        self.semgeo_cluster_version = -1
+        self._refresh_semgeo_cluster_visualization(force=True)
         self.ready = True
 
     def toggle_pause_button(self) -> None:
@@ -413,6 +425,37 @@ class Viewer:
     def _output_split_type_change(self, _):
         self.output_split_type_changed = True
 
+    def _set_semgeo_cluster_visibility(self) -> None:
+        if self.semgeo_cluster_handle is None or self.semgeo_cluster_toggle is None:
+            return
+        self.semgeo_cluster_handle.visible = self.semgeo_cluster_toggle.value
+
+    def _refresh_semgeo_cluster_visualization(self, force: bool = False) -> None:
+        if not hasattr(self.pipeline.model, "get_cluster_visualization_state"):
+            return
+        payload = cast(Any, self.pipeline.model).get_cluster_visualization_state()
+        if payload is None:
+            return
+        version = int(payload.get("version", 0))
+        if not force and version == self.semgeo_cluster_version:
+            self._set_semgeo_cluster_visibility()
+            return
+
+        points = np.asarray(payload["points"], dtype=np.float32) * VISER_NERFSTUDIO_SCALE_RATIO
+        colors = np.asarray(payload["colors"], dtype=np.uint8)
+        visible = self.semgeo_cluster_toggle.value if self.semgeo_cluster_toggle is not None else False
+        if self.semgeo_cluster_handle is not None:
+            self.semgeo_cluster_handle.remove()
+        self.semgeo_cluster_handle = self.viser_server.scene.add_point_cloud(
+            "/semgeo/3d_clusters",
+            points=points,
+            colors=colors,
+            point_size=float(payload.get("point_size", 0.02)),
+            point_shape="circle",
+            visible=visible,
+        )
+        self.semgeo_cluster_version = version
+
     def _pick_drawn_image_idxs(self, total_num: int) -> list[int]:
         """Determine indicies of images to display in viewer.
 
@@ -526,6 +569,7 @@ class Viewer:
                         self.render_statemachines[id].action(RenderAction("step", camera_state))
                 self.update_camera_poses()
                 self.update_step(step)
+                self._refresh_semgeo_cluster_visualization()
 
     def update_colormap_options(self, dimensions: int, dtype: type) -> None:
         """update the colormap options based on the current render

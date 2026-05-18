@@ -29,6 +29,7 @@ from nerfstudio.engine.optimizers import AdamOptimizerConfig, Optimizers
 from nerfstudio.engine.schedulers import ExponentialDecaySchedulerConfig
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.models.dino_splatfacto import DinoSplatfactoModelConfig
+from nerfstudio.models.semgeo_splatfacto import SemGeoSplatfactoModel, SemGeoSplatfactoModelConfig
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.utils import profiler, writer
@@ -54,48 +55,6 @@ class DirectPipeline:
     datamanager: FullImageDatamanager
     model: SplatfactoModel
 
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Direct Splatfacto training entrypoint.")
-    parser.add_argument("-s", "--source-path", type=Path, required=True, help="COLMAP dataset root.")
-    parser.add_argument("-m", "--model-path", type=Path, required=True, help="Output directory for config/checkpoints.")
-    parser.add_argument(
-        "--pipeline",
-        choices=["splatfacto", "dino-splatfacto"],
-        default="dino-splatfacto",
-        help="Pipeline to train.",
-    )
-    parser.add_argument("--max-steps", type=int, default=30000, help="Number of training iterations.")
-    parser.add_argument("--save-every", type=int, default=2000, help="Checkpoint period.")
-    parser.add_argument("--eval-image-every", type=int, default=100, help="Eval image period.")
-    parser.add_argument("--eval-all-every", type=int, default=1000, help="Eval-all period.")
-    parser.add_argument("--disable-viewer", action="store_true", help="Disable Viser during training.")
-    parser.add_argument("--viewer-port", type=int, default=None, help="Viewer websocket port override.")
-    parser.add_argument("--load-checkpoint", type=Path, default=None, help="Checkpoint to resume from.")
-    parser.add_argument("--resume", action="store_true", help="Resume from the latest checkpoint in the model dir.")
-    parser.add_argument("--vis", choices=["viewer", "none"], default="viewer", help="Visualization mode.")
-    parser.add_argument("--device", choices=["cuda", "mps", "cpu"], default="cuda", help="Training device.")
-    parser.add_argument("--data-device", choices=["cpu", "gpu", "disk"], default="gpu", help="Image cache target.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--steps-per-log", type=int, default=10, help="Scalar logging period.")
-    parser.add_argument("--mixed-precision", action="store_true", help="Enable autocast/GradScaler.")
-    parser.add_argument(
-        "--dino-feature-dir",
-        type=Path,
-        default=None,
-        help="Directory containing precomputed DINO .pt features (defaults to <model-path>/dino_features).",
-    )
-    parser.add_argument("--dino-feature-dim", type=int, default=16, help="DINO feature channel count after PCA.")
-    parser.add_argument("--dino-loss-weight", type=float, default=0.05, help="Loss weight for DINO feature L1 loss.")
-    parser.add_argument(
-        "--dino-loss-start-step",
-        type=int,
-        default=3000,
-        help="Enable DINO feature loss from this global training step.",
-    )
-    return parser.parse_args()
-
-
 def _set_random_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -105,9 +64,16 @@ def _set_random_seed(seed: int) -> None:
 def _build_config(args: argparse.Namespace) -> TrainerConfig:
     viewer_config = ViewerConfig(num_rays_per_chunk=1 << 15, websocket_port=args.viewer_port)
     use_dino_pipeline = args.pipeline == "dino-splatfacto"
+    use_semgeo_pipeline = args.pipeline == "semgeo-splatfacto"
 
-    if use_dino_pipeline:
-        dino_feature_dir = args.dino_feature_dir if args.dino_feature_dir is not None else args.model_path / "dino_features"
+    if use_dino_pipeline or use_semgeo_pipeline:
+        if args.dino_feature_dir is not None:
+            dino_feature_dir = args.dino_feature_dir
+        elif use_semgeo_pipeline and args.input_model_path is not None:
+            # SemGeo offline pipeline should reuse DINO features generated during dino-splatfacto training.
+            dino_feature_dir = args.input_model_path / "dino_features"
+        else:
+            dino_feature_dir = args.model_path / "dino_features"
         datamanager_config = DinoDatamanagerConfig(
             dataparser=ColmapDataParserConfig(data=args.source_path, load_3D_points=True),
             cache_images=args.data_device,
@@ -116,12 +82,23 @@ def _build_config(args: argparse.Namespace) -> TrainerConfig:
             dino_feature_dim=args.dino_feature_dim,
             strict_dino_loading=True,
         )
-        model_config = DinoSplatfactoModelConfig(
-            dino_feature_dim=args.dino_feature_dim,
-            dino_loss_weight=args.dino_loss_weight,
-            dino_loss_start_step=args.dino_loss_start_step,
-        )
-        method_name = "dino-splatfacto"
+        if use_semgeo_pipeline:
+            model_config = SemGeoSplatfactoModelConfig(
+                dino_feature_dim=args.dino_feature_dim,
+                dino_loss_weight=args.dino_loss_weight,
+                dino_loss_start_step=args.dino_loss_start_step,
+                cluster_refresh_start_step=args.cluster_refresh_start_step,
+                cluster_refresh_every=args.cluster_refresh_every,
+                style_num_primitives=args.style_num_primitives,
+            )
+            method_name = "semgeo-splatfacto"
+        else:
+            model_config = DinoSplatfactoModelConfig(
+                dino_feature_dim=args.dino_feature_dim,
+                dino_loss_weight=args.dino_loss_weight,
+                dino_loss_start_step=args.dino_loss_start_step,
+            )
+            method_name = "dino-splatfacto"
     else:
         datamanager_config = FullImageDatamanagerConfig(
             dataparser=ColmapDataParserConfig(data=args.source_path, load_3D_points=True),
@@ -160,7 +137,7 @@ def _build_config(args: argparse.Namespace) -> TrainerConfig:
             ),
         },
     }
-    if use_dino_pipeline:
+    if use_dino_pipeline or use_semgeo_pipeline:
         optimizers["dino_features"] = {
             "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
             "scheduler": None,
@@ -196,7 +173,7 @@ def _save_config(config: TrainerConfig, output_dir: Path) -> None:
 
 def _ensure_dino_features_ready(args: argparse.Namespace, pipeline: DirectPipeline) -> None:
     """Auto-extract missing DINO features before viewer/train accesses the dataset."""
-    if args.pipeline != "dino-splatfacto":
+    if args.pipeline not in {"dino-splatfacto", "semgeo-splatfacto"}:
         return
 
     train_dataset = pipeline.datamanager.train_dataset
@@ -265,6 +242,29 @@ def _ensure_dino_features_ready(args: argparse.Namespace, pipeline: DirectPipeli
         )
 
     CONSOLE.log(f"DINO feature auto-extraction finished. saved={total_saved}, skipped={total_skipped}")
+
+
+def _prepare_semgeo_assets(args: argparse.Namespace, pipeline: DirectPipeline, output_dir: Path, force_cluster_refresh: bool) -> None:
+    if args.pipeline != "semgeo-splatfacto":
+        return
+    if not isinstance(pipeline.model, SemGeoSplatfactoModel):
+        raise TypeError("semgeo-splatfacto pipeline expects SemGeoSplatfactoModel")
+    if not isinstance(pipeline.datamanager.train_dataset, DinoInputDataset):
+        raise TypeError("semgeo-splatfacto pipeline expects DinoInputDataset")
+
+    pipeline.model.maybe_refresh_semgeo_assets(
+        output_dir=output_dir,
+        style_image_path=args.style_image,
+        dino_feature_file=pipeline.datamanager.train_dataset.feature_file_path(),
+        force=False,
+    )
+    if force_cluster_refresh:
+        pipeline.model.maybe_refresh_semgeo_assets(
+            output_dir=output_dir,
+            style_image_path=None,
+            dino_feature_file=None,
+            force=True,
+        )
 
 
 def _get_seed_points(datamanager: FullImageDatamanager) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
@@ -362,6 +362,14 @@ def _load_checkpoint(
     return start_step
 
 
+def _load_model_only_checkpoint(pipeline: DirectPipeline, checkpoint_path: Path) -> int:
+    loaded_state = torch.load(checkpoint_path, map_location="cpu")
+    loaded_step = int(loaded_state["step"])
+    _load_model_checkpoint(pipeline.model, loaded_state["pipeline"], loaded_step)
+    CONSOLE.print(f"Loaded model weights from {checkpoint_path}")
+    return loaded_step
+
+
 def _save_checkpoint(
     pipeline: DirectPipeline,
     optimizers: Optimizers,
@@ -388,12 +396,59 @@ def _save_checkpoint(
                 other_checkpoint.unlink()
 
 
-def _resolve_checkpoint_path(args: argparse.Namespace, checkpoint_dir: Path) -> Optional[Path]:
+def _resolve_checkpoint_path(
+    args: argparse.Namespace,
+    checkpoint_dir: Path,
+    semgeo_input_checkpoint_dir: Optional[Path] = None,
+) -> Optional[Path]:
     if args.load_checkpoint is not None:
         return args.load_checkpoint
+    if args.pipeline == "semgeo-splatfacto" and semgeo_input_checkpoint_dir is not None:
+        # SemGeo offline mode defaults to the latest dino checkpoint in input-model-path.
+        return _find_latest_checkpoint(semgeo_input_checkpoint_dir)
     if args.resume:
         return _find_latest_checkpoint(checkpoint_dir)
     return None
+
+
+def _run_semgeo_offline_pipeline(
+    args: argparse.Namespace,
+    output_dir: Path,
+    checkpoint_dir: Path,
+    pipeline: DirectPipeline,
+    optimizers: Optimizers,
+    grad_scaler: GradScaler,
+    checkpoint_path: Path,
+) -> int:
+    if not isinstance(pipeline.model, SemGeoSplatfactoModel):
+        raise TypeError("semgeo-splatfacto pipeline expects SemGeoSplatfactoModel")
+
+    loaded_step = _load_model_only_checkpoint(pipeline=pipeline, checkpoint_path=checkpoint_path)
+    pipeline.model.update_to_step(loaded_step)
+
+    _prepare_semgeo_assets(
+        args=args,
+        pipeline=pipeline,
+        output_dir=output_dir,
+        force_cluster_refresh=True,
+    )
+
+    fgw_record = pipeline.model.run_fgw_alignment_placeholder(output_dir=output_dir)
+    style_record = pipeline.model.run_style_transfer_placeholder(output_dir=output_dir)
+
+    _save_checkpoint(
+        pipeline=pipeline,
+        optimizers=optimizers,
+        grad_scaler=grad_scaler,
+        checkpoint_dir=checkpoint_dir,
+        step=loaded_step,
+        save_only_latest=True,
+    )
+
+    CONSOLE.print(f"SemGeo offline output written to {output_dir}")
+    CONSOLE.print(f"FGW placeholder record: {fgw_record}")
+    CONSOLE.print(f"Style placeholder record: {style_record}")
+    return loaded_step
 
 
 def _setup_viewer(
@@ -495,6 +550,9 @@ def _run_train_loop(
 
                     # 让模型完成这一轮训练后的收尾处理。
                     model.finish_train_step(step)
+                    if hasattr(model, "maybe_refresh_semgeo_assets"):
+                        maybe_refresh = cast(Any, getattr(model, "maybe_refresh_semgeo_assets"))
+                        maybe_refresh(output_dir=output_dir, style_image_path=None, dino_feature_file=None, force=False)
 
             # 统计训练速度，按帧/秒或射线/秒记录。
             if step > 1:
@@ -539,6 +597,9 @@ def _run_train_loop(
 
     # 训练结束后更新状态并保存最终 checkpoint。
     session_state.training_state = "completed"
+    if hasattr(model, "maybe_refresh_semgeo_assets"):
+        maybe_refresh = cast(Any, getattr(model, "maybe_refresh_semgeo_assets"))
+        maybe_refresh(output_dir=output_dir, style_image_path=None, dino_feature_file=None, force=True)
     _save_checkpoint(
         pipeline=pipeline,
         optimizers=optimizers,
@@ -562,6 +623,57 @@ def _run_train_loop(
                 time.sleep(0.01)
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Direct Splatfacto training entrypoint.")
+    parser.add_argument("-s", "--source-path", type=Path, required=True, help="COLMAP dataset root.")
+    parser.add_argument("-m", "--model-path", type=Path, required=True, help="Output directory for config/checkpoints.")
+    parser.add_argument(
+        "--pipeline",
+        choices=["splatfacto", "dino-splatfacto", "semgeo-splatfacto"],
+        default="dino-splatfacto",
+        help="Pipeline to train.",
+    )
+    parser.add_argument("--max-steps", type=int, default=30000, help="Number of training iterations.")
+    parser.add_argument("--save-every", type=int, default=2000, help="Checkpoint period.")
+    parser.add_argument("--eval-image-every", type=int, default=100, help="Eval image period.")
+    parser.add_argument("--eval-all-every", type=int, default=1000, help="Eval-all period.")
+    parser.add_argument("--disable-viewer", action="store_true", help="Disable Viser during training.")
+    parser.add_argument("--viewer-port", type=int, default=None, help="Viewer websocket port override.")
+    parser.add_argument("--load-checkpoint", type=Path, default=None, help="Checkpoint to resume from.")
+    parser.add_argument("--resume", action="store_true", help="Resume from the latest checkpoint in the model dir.")
+    parser.add_argument(
+        "--input-model-path",
+        type=Path,
+        default=None,
+        help="Input model directory for semgeo-splatfacto (used to find dino checkpoints and dino_features).",
+    )
+    parser.add_argument("--vis", choices=["viewer", "none"], default="viewer", help="Visualization mode.")
+    parser.add_argument("--device", choices=["cuda", "mps", "cpu"], default="cuda", help="Training device.")
+    parser.add_argument("--data-device", choices=["cpu", "gpu", "disk"], default="gpu", help="Image cache target.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--steps-per-log", type=int, default=10, help="Scalar logging period.")
+    parser.add_argument("--mixed-precision", action="store_true", help="Enable autocast/GradScaler.")
+    parser.add_argument(
+        "--dino-feature-dir",
+        type=Path,
+        default=None,
+        help="Directory containing precomputed DINO .pt features (defaults to <model-path>/dino_features).",
+    )
+    parser.add_argument("--dino-feature-dim", type=int, default=16, help="DINO feature channel count after PCA.")
+    parser.add_argument("--dino-loss-weight", type=float, default=0.05, help="Loss weight for DINO feature L1 loss.")
+    parser.add_argument(
+        "--dino-loss-start-step",
+        type=int,
+        default=3000,
+        help="Enable DINO feature loss from this global training step.",
+    )
+    parser.add_argument("--style-image", type=Path, default=None, help="Style image used by semgeo-splatfacto Stage 2.")
+    parser.add_argument("--style-num-primitives", type=int, default=8, help="Style primitive cluster count.")
+    parser.add_argument("--cluster-refresh-every", type=int, default=2000, help="Stage 1 cluster refresh period.")
+    parser.add_argument("--cluster-refresh-start-step", type=int, default=3000, help="First step that enables Stage 1 clustering.")
+    return parser.parse_args()
+
+
 def main() -> None:
     args = _parse_args()
     config = _build_config(args)
@@ -577,6 +689,11 @@ def main() -> None:
         device = "cuda:0"
     output_dir = args.model_path.resolve()
     checkpoint_dir = output_dir / config.relative_model_dir
+    semgeo_input_checkpoint_dir = (
+        args.input_model_path.resolve() / config.relative_model_dir
+        if args.pipeline == "semgeo-splatfacto" and args.input_model_path is not None
+        else None
+    )
     _set_random_seed(config.machine.seed)
     _save_config(config, output_dir)
     CONSOLE.log(f"Saving checkpoints to: {checkpoint_dir}")
@@ -588,6 +705,52 @@ def main() -> None:
     grad_scaler = GradScaler(enabled=config.mixed_precision or config.use_grad_scaler)
     pipeline, optimizers = _setup_pipeline(config=config, device=device, grad_scaler=grad_scaler)
     _ensure_dino_features_ready(args=args, pipeline=pipeline)
+
+    checkpoint_path = _resolve_checkpoint_path(
+        args,
+        checkpoint_dir,
+        semgeo_input_checkpoint_dir=semgeo_input_checkpoint_dir,
+    )
+
+    if args.pipeline == "semgeo-splatfacto":
+        if checkpoint_path is None:
+            raise ValueError(
+                "semgeo-splatfacto requires an input dino checkpoint. "
+                "Use --load-checkpoint or set --input-model-path to a directory containing nerfstudio_models/step-*.ckpt."
+            )
+        loaded_step = _run_semgeo_offline_pipeline(
+            args=args,
+            output_dir=output_dir,
+            checkpoint_dir=checkpoint_dir,
+            pipeline=pipeline,
+            optimizers=optimizers,
+            grad_scaler=grad_scaler,
+            checkpoint_path=checkpoint_path,
+        )
+
+        viewer = _setup_viewer(
+            config=config,
+            output_dir=output_dir,
+            source_path=args.source_path.resolve(),
+            pipeline=pipeline,
+            session_state=session_state,
+            train_lock=train_lock,
+        )
+        if viewer is not None:
+            session_state.training_state = "completed"
+            viewer.update_scene(loaded_step, pipeline.datamanager.get_train_rays_per_batch())
+            viewer.training_complete()
+            CONSOLE.print("SemGeo viewer is running. Use ctrl+c to quit", justify="center")
+            try:
+                while True:
+                    time.sleep(0.01)
+            except KeyboardInterrupt:
+                CONSOLE.print("Shutting down SemGeo viewer...")
+            finally:
+                viewer.viser_server.stop()
+        return
+
+    _prepare_semgeo_assets(args=args, pipeline=pipeline, output_dir=output_dir, force_cluster_refresh=False)
 
     viewer = _setup_viewer(
         config=config,
@@ -601,7 +764,6 @@ def main() -> None:
     _setup_runtime_logging(config, output_dir, banner_messages)
 
     start_step = 0
-    checkpoint_path = _resolve_checkpoint_path(args, checkpoint_dir)
     if checkpoint_path is not None:
         start_step = _load_checkpoint(
             pipeline=pipeline,
@@ -611,6 +773,13 @@ def main() -> None:
         )
     else:
         CONSOLE.print("No checkpoint to load, training from scratch.")
+
+    _prepare_semgeo_assets(
+        args=args,
+        pipeline=pipeline,
+        output_dir=output_dir,
+        force_cluster_refresh=start_step > 0 and args.pipeline == "semgeo-splatfacto",
+    )
 
     try:
         _run_train_loop(

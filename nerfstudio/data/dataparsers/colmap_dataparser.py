@@ -390,6 +390,29 @@ class ColmapDataParser(DataParser):
             scaling_factor=1.0 / downscale_factor, scale_rounding_mode=self.config.downscale_rounding_mode
         )
 
+        if downscale_factor > 1 and len(image_filenames) > 0:
+            # Check the actual size of the downscaled images to ensure camera resolution matches
+            # The mipnerf360 dataset provides downscaled images that are rounded using "round",
+            # creating a 1px difference with "floor".
+            import PIL.Image
+            try:
+                first_img_path = image_filenames[0]
+                if first_img_path.exists():
+                    actual_w, actual_h = PIL.Image.open(first_img_path).size
+                    cam_w = cameras.width[0].item()
+                    cam_h = cameras.height[0].item()
+                    if actual_w != cam_w or actual_h != cam_h:
+                        from nerfstudio.utils.rich_utils import CONSOLE
+                        CONSOLE.print(f"[bold yellow]Warning: Downscaled image resolution ({actual_w}, {actual_h}) does not match camera resolution ({cam_w}, {cam_h}). Adjusting camera.[/bold yellow]")
+                        diff_w = actual_w - cam_w
+                        diff_h = actual_h - cam_h
+                        cameras.width += diff_w
+                        cameras.height += diff_h
+                        cameras.cx += diff_w / 2.0
+                        cameras.cy += diff_h / 2.0
+            except Exception:
+                pass
+
         if "applied_transform" in meta:
             applied_transform = torch.tensor(meta["applied_transform"], dtype=transform_matrix.dtype)
             transform_matrix = transform_matrix @ torch.cat(

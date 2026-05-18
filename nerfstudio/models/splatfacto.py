@@ -128,7 +128,7 @@ class SplatfactoModelConfig(ModelConfig):
     """stop splitting at this step"""
     sh_degree: int = 3
     """maximum degree of spherical harmonics to use"""
-    use_scale_regularization: bool = False
+    use_scale_regularization: bool = True
     """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
     max_gauss_ratio: float = 10.0
     """threshold of ratio of gaussian max to min scale before applying regularization
@@ -185,18 +185,22 @@ class SplatfactoModel(Model):
         super().__init__(*args, **kwargs)
 
     def populate_modules(self):
+        # 初始化高斯参数：优先使用外部 seed_points，否则随机生成一组初始高斯中心。
         if self.seed_points is not None and not self.config.random_init:
             means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
         else:
             means = torch.nn.Parameter((torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale)
+        # 用每个点的近邻距离来估计初始尺度，让高斯一开始的大小和点密度匹配。
         distances, _ = k_nearest_sklearn(means.data, 3)
         # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
         scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
         num_points = means.shape[0]
+        # 四元数用于表示每个高斯的旋转。
         quats = torch.nn.Parameter(random_quat_tensor(num_points))
         dim_sh = num_sh_bases(self.config.sh_degree)
 
+        # 如果给了 seed color，就把颜色初始化到球谐系数；否则随机初始化颜色和其余系数。
         if (
             self.seed_points is not None
             and not self.config.random_init
@@ -216,6 +220,7 @@ class SplatfactoModel(Model):
             features_dc = torch.nn.Parameter(torch.rand(num_points, 3))
             features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
 
+        # 不透明度初始化得比较保守，避免一开始整场景都过于“实心”。
         opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
         gauss_params = {
             "means": means,
@@ -227,11 +232,12 @@ class SplatfactoModel(Model):
         }
         self.gauss_params = torch.nn.ParameterDict(gauss_params)
 
+        # 相机优化器只在训练中参与，负责微调相机位姿。
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
         )
 
-        # metrics
+        # 构建训练/评估要用的指标。
         from torchmetrics.image import PeakSignalNoiseRatio
         from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
@@ -240,13 +246,16 @@ class SplatfactoModel(Model):
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
         self.step = 0
 
+        # crop_box 用于评估阶段裁剪局部区域渲染。
         self.crop_box: Optional[OrientedBox] = None
         if self.config.background_color == "random":
+            # 随机背景训练时，采用一个默认背景色作为基底。
             self.background_color = torch.tensor(
                 [0.1490, 0.1647, 0.2157]
             )  # This color is the same as the default background color in Viser. This would only affect the background color when rendering.
         else:
             self.background_color = get_color(self.config.background_color)
+        # 可选的 bilateral grid，用来做图像空间颜色校正。
         if self.config.use_bilateral_grid:
             self.bil_grids = BilateralGrid(
                 num=self.num_train_data,
@@ -255,9 +264,8 @@ class SplatfactoModel(Model):
                 grid_W=self.config.grid_shape[2],
             )
 
-        # Strategy for GS densification
+        # 高斯增密/裁剪策略：default 是基于梯度和尺寸的 densify/prune，mcmc 是采样式策略。
         if self.config.strategy == "default":
-            # Strategy for GS densification
             self.strategy = DefaultStrategy(
                 prune_opa=self.config.cull_alpha_thresh,
                 grow_grad2d=self.config.densify_grad_thresh,
@@ -275,6 +283,7 @@ class SplatfactoModel(Model):
                 revised_opacity=False,
                 verbose=True,
             )
+            # 默认策略用固定场景尺度初始化状态。
             self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
         elif self.config.strategy == "mcmc":
             self.strategy = MCMCStrategy(
@@ -286,6 +295,7 @@ class SplatfactoModel(Model):
                 min_opacity=self.config.cull_alpha_thresh,
                 verbose=False,
             )
+            # MCMC 策略使用其自己的状态初始化方式。
             self.strategy_state = self.strategy.initialize_state()
         else:
             raise ValueError(f"""Splatfacto does not support strategy {self.config.strategy}
