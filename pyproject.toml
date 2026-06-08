@@ -133,8 +133,6 @@ ns-eval = "nerfstudio.scripts.eval:entrypoint"
 ns-render = "nerfstudio.scripts.render:entrypoint"
 ns-export = "nerfstudio.scripts.exporter:entrypoint"
 ns-dev-test = "nerfstudio.scripts.github.run_actions:entrypoint"
-ns-dev-sync-viser-message-defs = "nerfstudio.scripts.viewer.sync_viser_message_defs:entrypoint"
-
 [tool.setuptools.packages.find]
 include = ["nerfstudio*"]
 

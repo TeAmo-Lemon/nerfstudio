@@ -32,22 +32,18 @@ from typing_extensions import assert_never
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer
 from nerfstudio.cameras.cameras import CameraType
 from nerfstudio.configs import base_config as cfg
-from nerfstudio.data.datasets.base_dataset import InputDataset
-from nerfstudio.models.base_model import Model
+from nerfstudio.data.datasets import InputDataset
 from nerfstudio.models.splatfacto import SplatfactoModel
-from nerfstudio.pipelines.base_pipeline import Pipeline
+from nerfstudio.pipelines.base_pipeline import VanillaPipeline
 from nerfstudio.utils.decorators import check_main_thread, decorate_all
 from nerfstudio.utils.writer import GLOBAL_BUFFER, EventName
 from nerfstudio.viewer.control_panel import ControlPanel
 from nerfstudio.viewer.export_panel import populate_export_tab
 from nerfstudio.viewer.render_panel import populate_render_tab
 from nerfstudio.viewer.render_state_machine import RenderAction, RenderStateMachine
-from nerfstudio.viewer.utils import CameraState, parse_object
+from nerfstudio.viewer.utils import CameraState, get_free_port, parse_object
 from nerfstudio.viewer.viewer_elements import ViewerControl, ViewerElement
-from nerfstudio.viewer_legacy.server import viewer_utils
 
-if TYPE_CHECKING:
-    from nerfstudio.engine.trainer import Trainer
 
 
 VISER_NERFSTUDIO_SCALE_RATIO: float = 10.0
@@ -78,8 +74,8 @@ class Viewer:
         config: cfg.ViewerConfig,
         log_filename: Path,
         datapath: Path,
-        pipeline: Pipeline,
-        trainer: Optional[Trainer] = None,
+        pipeline: VanillaPipeline,
+        trainer: Optional[Any] = None,
         train_lock: Optional[threading.Lock] = None,
         share: bool = False,
     ):
@@ -94,7 +90,7 @@ class Viewer:
         self.include_time = self.pipeline.datamanager.includes_time
 
         if self.config.websocket_port is None:
-            websocket_port = viewer_utils.get_free_port(default_port=self.config.websocket_port_default)
+            websocket_port = get_free_port(default_port=self.config.websocket_port_default)
         else:
             websocket_port = self.config.websocket_port
         self.log_filename.parent.mkdir(exist_ok=True)
@@ -207,15 +203,6 @@ class Viewer:
                 self._output_split_type_change,
                 default_composite_depth=self.config.default_composite_depth,
             )
-            self.semgeo_cluster_toggle = None
-            if hasattr(pipeline.model, "get_cluster_visualization_state"):
-                with self.viser_server.gui.add_folder("SemGeo"):
-                    self.semgeo_cluster_toggle = self.viser_server.gui.add_checkbox(
-                        "Show 3D Clusters",
-                        False,
-                        hint="Display the latest 3D semantic clustering as a colored point cloud.",
-                    )
-                    self.semgeo_cluster_toggle.on_update(lambda _: self._set_semgeo_cluster_visibility())
         config_path = self.log_filename.parents[0] / "config.yml"
         with tabs.add_tab("Render", viser.Icon.CAMERA):
             self.render_tab_state = populate_render_tab(
@@ -264,15 +251,6 @@ class Viewer:
                     nested_folder_install(folder_labels[1:], prev_labels + [folder_labels[0]], element)
 
         with control_tab:
-            from nerfstudio.viewer_legacy.server.viewer_elements import ViewerElement as LegacyViewerElement
-
-            if len(parse_object(pipeline, LegacyViewerElement, "Custom Elements")) > 0:
-                from nerfstudio.utils.rich_utils import CONSOLE
-
-                CONSOLE.print(
-                    "Legacy ViewerElements detected in model, please import nerfstudio.viewer.viewer_elements instead",
-                    style="bold yellow",
-                )
             self.viewer_elements = []
             self.viewer_elements.extend(parse_object(pipeline, ViewerElement, "Custom Elements"))
             for param_path, element in self.viewer_elements:
@@ -297,9 +275,6 @@ class Viewer:
                 point_shape="circle",
                 visible=False,  # Hidden by default.
             )
-        self.semgeo_cluster_handle = None
-        self.semgeo_cluster_version = -1
-        self._refresh_semgeo_cluster_visualization(force=True)
         self.ready = True
 
     def toggle_pause_button(self) -> None:
@@ -425,37 +400,6 @@ class Viewer:
     def _output_split_type_change(self, _):
         self.output_split_type_changed = True
 
-    def _set_semgeo_cluster_visibility(self) -> None:
-        if self.semgeo_cluster_handle is None or self.semgeo_cluster_toggle is None:
-            return
-        self.semgeo_cluster_handle.visible = self.semgeo_cluster_toggle.value
-
-    def _refresh_semgeo_cluster_visualization(self, force: bool = False) -> None:
-        if not hasattr(self.pipeline.model, "get_cluster_visualization_state"):
-            return
-        payload = cast(Any, self.pipeline.model).get_cluster_visualization_state()
-        if payload is None:
-            return
-        version = int(payload.get("version", 0))
-        if not force and version == self.semgeo_cluster_version:
-            self._set_semgeo_cluster_visibility()
-            return
-
-        points = np.asarray(payload["points"], dtype=np.float32) * VISER_NERFSTUDIO_SCALE_RATIO
-        colors = np.asarray(payload["colors"], dtype=np.uint8)
-        visible = self.semgeo_cluster_toggle.value if self.semgeo_cluster_toggle is not None else False
-        if self.semgeo_cluster_handle is not None:
-            self.semgeo_cluster_handle.remove()
-        self.semgeo_cluster_handle = self.viser_server.scene.add_point_cloud(
-            "/semgeo/3d_clusters",
-            points=points,
-            colors=colors,
-            point_size=float(payload.get("point_size", 0.02)),
-            point_shape="circle",
-            visible=visible,
-        )
-        self.semgeo_cluster_version = version
-
     def _pick_drawn_image_idxs(self, total_num: int) -> list[int]:
         """Determine indicies of images to display in viewer.
 
@@ -569,7 +513,6 @@ class Viewer:
                         self.render_statemachines[id].action(RenderAction("step", camera_state))
                 self.update_camera_poses()
                 self.update_step(step)
-                self._refresh_semgeo_cluster_visualization()
 
     def update_colormap_options(self, dimensions: int, dtype: type) -> None:
         """update the colormap options based on the current render
@@ -593,7 +536,7 @@ class Viewer:
             self.control_panel.update_split_colormap_options(dimensions, dtype)
             self.output_split_type_changed = False
 
-    def get_model(self) -> Model:
+    def get_model(self) -> SplatfactoModel:
         """Returns the model."""
         return self.pipeline.model
 

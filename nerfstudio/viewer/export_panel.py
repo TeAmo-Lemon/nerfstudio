@@ -21,7 +21,6 @@ import viser.transforms as vtf
 from typing_extensions import Literal
 
 from nerfstudio.data.scene_box import OrientedBox
-from nerfstudio.models.base_model import Model
 from nerfstudio.models.splatfacto import SplatfactoModel
 from nerfstudio.viewer.control_panel import ControlPanel
 
@@ -30,7 +29,7 @@ def populate_export_tab(
     server: viser.ViserServer,
     control_panel: ControlPanel,
     config_path: Path,
-    viewer_model: Model,
+    viewer_model: SplatfactoModel,
 ) -> None:
     viewing_gsplat = isinstance(viewer_model, SplatfactoModel)
     if not viewing_gsplat:

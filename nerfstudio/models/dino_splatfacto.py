@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Type, Union, cast
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +16,12 @@ except ImportError:
 
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig, get_viewmat
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DinoDefaultStrategy — delegates densify/prune ops to the model so DINO
+# features stay in sync with Gaussian params.
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -54,7 +60,6 @@ class DinoDefaultStrategy(DefaultStrategy):
             is_split |= state["radii"] > self.grow_scale2d
         n_split = int(is_split.sum().item())
 
-        # New GSs added by duplication should not be split in this refinement step.
         if n_dupli > 0:
             is_split = torch.cat([is_split, torch.zeros(n_dupli, dtype=torch.bool, device=device)], dim=0)
 
@@ -89,6 +94,11 @@ class DinoDefaultStrategy(DefaultStrategy):
         return n_prune
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# DinoSplatfactoModel
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 @dataclass
 class DinoSplatfactoModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: DinoSplatfactoModel)
@@ -100,8 +110,12 @@ class DinoSplatfactoModelConfig(SplatfactoModelConfig):
 class DinoSplatfactoModel(SplatfactoModel):
     """Splatfacto model with DINO feature splatting and feature distillation loss."""
 
+    # ── helpers ──────────────────────────────────────────────────────────
+
     def _dino_config(self) -> DinoSplatfactoModelConfig:
         return cast(DinoSplatfactoModelConfig, self.config)
+
+    # ── setup ────────────────────────────────────────────────────────────
 
     def populate_modules(self):
         super().populate_modules()
@@ -112,106 +126,7 @@ class DinoSplatfactoModel(SplatfactoModel):
         )
         self._override_default_strategy_with_dino_strategy()
 
-    def _override_default_strategy_with_dino_strategy(self) -> None:
-        if not isinstance(self.strategy, DefaultStrategy):
-            return
-
-        strategy = cast(DefaultStrategy, self.strategy)
-        self.strategy = DinoDefaultStrategy(
-            prune_opa=strategy.prune_opa,
-            grow_grad2d=strategy.grow_grad2d,
-            grow_scale3d=strategy.grow_scale3d,
-            grow_scale2d=strategy.grow_scale2d,
-            prune_scale3d=strategy.prune_scale3d,
-            prune_scale2d=strategy.prune_scale2d,
-            refine_scale2d_stop_iter=strategy.refine_scale2d_stop_iter,
-            refine_start_iter=strategy.refine_start_iter,
-            refine_stop_iter=strategy.refine_stop_iter,
-            reset_every=strategy.reset_every,
-            refine_every=strategy.refine_every,
-            pause_refine_after_reset=strategy.pause_refine_after_reset,
-            absgrad=strategy.absgrad,
-            revised_opacity=strategy.revised_opacity,
-            verbose=strategy.verbose,
-            key_for_gradient=strategy.key_for_gradient,
-            model_ref=self,
-        )
-        scene_scale = 1.0
-        if isinstance(self.strategy_state, dict) and "scene_scale" in self.strategy_state:
-            scene_scale = float(self.strategy_state["scene_scale"])
-        self.strategy_state = self.strategy.initialize_state(scene_scale=scene_scale)
-
-    @property
-    def dino_features(self):
-        return self.gauss_params["dino_features"]
-
-    def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
-        groups = super().get_gaussian_param_groups()
-        groups["dino_features"] = [self.gauss_params["dino_features"]]
-        return groups
-
-    @torch.no_grad()
-    def _clone_gaussians(self, mask: torch.Tensor, state: Dict[str, Any]) -> None:
-        duplicate(params=self.gauss_params, optimizers=self.optimizers, state=state, mask=mask)
-
-    @torch.no_grad()
-    def _split_gaussians(self, mask: torch.Tensor, state: Dict[str, Any], revised_opacity: bool = False) -> None:
-        split(
-            params=self.gauss_params,
-            optimizers=self.optimizers,
-            state=state,
-            mask=mask,
-            revised_opacity=revised_opacity,
-        )
-
-    @torch.no_grad()
-    def _cull_gaussians(self, mask: torch.Tensor, state: Dict[str, Any]) -> None:
-        remove(params=self.gauss_params, optimizers=self.optimizers, state=state, mask=mask)
-
-    def finish_train_step(self, step):
-        super().finish_train_step(step)
-        if self.dino_features.shape[0] != self.means.shape[0]:
-            raise RuntimeError(
-                "DINO feature count is out of sync with Gaussian count: "
-                f"{self.dino_features.shape[0]} != {self.means.shape[0]}"
-            )
-
-    def _select_render_tensors(
-        self, crop_ids: Optional[torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if crop_ids is None:
-            return (
-                self.means,
-                self.quats,
-                self.scales,
-                self.opacities,
-                self.dino_features,
-                self.features_dc,
-            )
-
-        return (
-            self.means[crop_ids],
-            self.quats[crop_ids],
-            self.scales[crop_ids],
-            self.opacities[crop_ids],
-            self.dino_features[crop_ids],
-            self.features_dc[crop_ids],
-        )
-
-    def _semantic_rgb_from_features(self, rendered_features: torch.Tensor) -> torch.Tensor:
-        semantic = rendered_features[..., :3]
-        if semantic.shape[-1] < 3:
-            pad = torch.zeros(
-                (*semantic.shape[:2], 3 - semantic.shape[-1]),
-                device=semantic.device,
-                dtype=semantic.dtype,
-            )
-            semantic = torch.cat([semantic, pad], dim=-1)
-
-        min_vals = semantic.amin(dim=(0, 1), keepdim=True)
-        max_vals = semantic.amax(dim=(0, 1), keepdim=True)
-        semantic = (semantic - min_vals) / (max_vals - min_vals).clamp_min(1e-6)
-        return semantic.clamp(0.0, 1.0)
+    # ── core rendering ───────────────────────────────────────────────────
 
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         outputs = super().get_outputs(camera)
@@ -243,7 +158,7 @@ class DinoSplatfactoModel(SplatfactoModel):
         width, height = int(camera.width.item()), int(camera.height.item())
         camera.rescale_output_resolution(camera_scale_fac)
 
-        rendered_features, _, _ = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
+        rendered_features, _, _ = rasterization(
             means=means_crop,
             quats=quats_crop,
             scales=torch.exp(scales_crop),
@@ -268,27 +183,7 @@ class DinoSplatfactoModel(SplatfactoModel):
         outputs["dino_semantic_rgb"] = self._semantic_rgb_from_features(rendered_features)
         return outputs
 
-    def _prepare_gt_dino_feature(self, gt_feature: torch.Tensor, pred_hw: Tuple[int, int]) -> torch.Tensor:
-        gt = gt_feature
-        cfg = self._dino_config()
-        if gt.ndim == 4 and gt.shape[0] == 1:
-            gt = gt.squeeze(0)
-        if gt.ndim != 3:
-            raise ValueError(f"Expected GT dino feature to be 3D tensor, got shape {tuple(gt.shape)}")
-
-        if gt.shape[0] == cfg.dino_feature_dim and gt.shape[-1] != cfg.dino_feature_dim:
-            gt = gt.permute(1, 2, 0).contiguous()
-
-        if gt.shape[:2] != pred_hw:
-            gt = F.interpolate(
-                gt.permute(2, 0, 1).unsqueeze(0),
-                size=pred_hw,
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0)
-            gt = gt.permute(1, 2, 0).contiguous()
-
-        return gt
+    # ── training loss & metrics ──────────────────────────────────────────
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         loss_dict = super().get_loss_dict(outputs, batch, metrics_dict)
@@ -296,7 +191,6 @@ class DinoSplatfactoModel(SplatfactoModel):
 
         if self.step < cfg.dino_loss_start_step:
             return loss_dict
-
         if "rendered_features" not in outputs or "dino_feature" not in batch:
             return loss_dict
 
@@ -336,3 +230,109 @@ class DinoSplatfactoModel(SplatfactoModel):
             metrics_dict["dino_l1"] = F.l1_loss(pred[..., :common_dim], gt[..., :common_dim]).detach()
 
         return metrics_dict
+
+    # ── training lifecycle ───────────────────────────────────────────────
+
+    def finish_train_step(self, step):
+        super().finish_train_step(step)
+        if self.dino_features.shape[0] != self.means.shape[0]:
+            raise RuntimeError(
+                "DINO feature count is out of sync with Gaussian count: "
+                f"{self.dino_features.shape[0]} != {self.means.shape[0]}"
+            )
+
+    # ── optimizer param groups ───────────────────────────────────────────
+
+    def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
+        groups = super().get_gaussian_param_groups()
+        groups["dino_features"] = [self.gauss_params["dino_features"]]
+        return groups
+
+    # ── properties ───────────────────────────────────────────────────────
+
+    @property
+    def dino_features(self):
+        return self.gauss_params["dino_features"]
+
+    # ── private helpers ──────────────────────────────────────────────────
+
+    def _override_default_strategy_with_dino_strategy(self) -> None:
+        if not isinstance(self.strategy, DefaultStrategy):
+            return
+
+        strategy = cast(DefaultStrategy, self.strategy)
+        self.strategy = DinoDefaultStrategy(
+            prune_opa=strategy.prune_opa,
+            grow_grad2d=strategy.grow_grad2d,
+            grow_scale3d=strategy.grow_scale3d,
+            grow_scale2d=strategy.grow_scale2d,
+            prune_scale3d=strategy.prune_scale3d,
+            prune_scale2d=strategy.prune_scale2d,
+            refine_scale2d_stop_iter=strategy.refine_scale2d_stop_iter,
+            refine_start_iter=strategy.refine_start_iter,
+            refine_stop_iter=strategy.refine_stop_iter,
+            reset_every=strategy.reset_every,
+            refine_every=strategy.refine_every,
+            pause_refine_after_reset=strategy.pause_refine_after_reset,
+            absgrad=strategy.absgrad,
+            revised_opacity=strategy.revised_opacity,
+            verbose=strategy.verbose,
+            key_for_gradient=strategy.key_for_gradient,
+            model_ref=self,
+        )
+        scene_scale = 1.0
+        if isinstance(self.strategy_state, dict) and "scene_scale" in self.strategy_state:
+            scene_scale = float(self.strategy_state["scene_scale"])
+        self.strategy_state = self.strategy.initialize_state(scene_scale=scene_scale)
+
+    @torch.no_grad()
+    def _clone_gaussians(self, mask: torch.Tensor, state: Dict[str, Any]) -> None:
+        duplicate(params=self.gauss_params, optimizers=self.optimizers, state=state, mask=mask)
+
+    @torch.no_grad()
+    def _split_gaussians(self, mask: torch.Tensor, state: Dict[str, Any], revised_opacity: bool = False) -> None:
+        split(params=self.gauss_params, optimizers=self.optimizers, state=state, mask=mask, revised_opacity=revised_opacity)
+
+    @torch.no_grad()
+    def _cull_gaussians(self, mask: torch.Tensor, state: Dict[str, Any]) -> None:
+        remove(params=self.gauss_params, optimizers=self.optimizers, state=state, mask=mask)
+
+    def _select_render_tensors(
+        self, crop_ids: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if crop_ids is None:
+            return self.means, self.quats, self.scales, self.opacities, self.dino_features, self.features_dc
+        return (
+            self.means[crop_ids],
+            self.quats[crop_ids],
+            self.scales[crop_ids],
+            self.opacities[crop_ids],
+            self.dino_features[crop_ids],
+            self.features_dc[crop_ids],
+        )
+
+    def _semantic_rgb_from_features(self, rendered_features: torch.Tensor) -> torch.Tensor:
+        semantic = rendered_features[..., :3]
+        if semantic.shape[-1] < 3:
+            pad = torch.zeros((*semantic.shape[:2], 3 - semantic.shape[-1]), device=semantic.device, dtype=semantic.dtype)
+            semantic = torch.cat([semantic, pad], dim=-1)
+        min_vals = semantic.amin(dim=(0, 1), keepdim=True)
+        max_vals = semantic.amax(dim=(0, 1), keepdim=True)
+        semantic = (semantic - min_vals) / (max_vals - min_vals).clamp_min(1e-6)
+        return semantic.clamp(0.0, 1.0)
+
+    def _prepare_gt_dino_feature(self, gt_feature: torch.Tensor, pred_hw: Tuple[int, int]) -> torch.Tensor:
+        gt = gt_feature
+        cfg = self._dino_config()
+        if gt.ndim == 4 and gt.shape[0] == 1:
+            gt = gt.squeeze(0)
+        if gt.ndim != 3:
+            raise ValueError(f"Expected GT dino feature to be 3D tensor, got shape {tuple(gt.shape)}")
+        if gt.shape[0] == cfg.dino_feature_dim and gt.shape[-1] != cfg.dino_feature_dim:
+            gt = gt.permute(1, 2, 0).contiguous()
+        if gt.shape[:2] != pred_hw:
+            gt = F.interpolate(
+                gt.permute(2, 0, 1).unsqueeze(0), size=pred_hw, mode="bilinear", align_corners=False
+            ).squeeze(0)
+            gt = gt.permute(1, 2, 0).contiguous()
+        return gt

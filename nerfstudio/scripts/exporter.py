@@ -35,7 +35,7 @@ import tyro
 from typing_extensions import Annotated, Literal
 
 from nerfstudio.cameras.rays import RayBundle
-from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager
+from nerfstudio.data.datamanagers import VanillaDataManager
 from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManager
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.exporter import texture_utils, tsdf_utils
@@ -43,7 +43,7 @@ from nerfstudio.exporter.exporter_utils import collect_camera_poses, generate_po
 from nerfstudio.exporter.marching_cubes import generate_mesh_with_multires_marching_cubes
 from nerfstudio.fields.sdf_field import SDFField  # noqa
 from nerfstudio.models.splatfacto import SplatfactoModel
-from nerfstudio.pipelines.base_pipeline import Pipeline, VanillaPipeline
+from nerfstudio.pipelines.base_pipeline import VanillaPipeline
 from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE
 
@@ -58,13 +58,13 @@ class Exporter:
     """Path to the output directory."""
 
 
-def validate_pipeline(normal_method: str, normal_output_name: str, pipeline: Pipeline) -> None:
+def validate_pipeline(normal_method: str, normal_output_name: str, pipeline: VanillaPipeline) -> None:
     """Check that the pipeline is valid for this exporter.
 
     Args:
         normal_method: Method to estimate normals with. Either "open3d" or "model_output".
         normal_output_name: Name of the normal output.
-        pipeline: Pipeline to evaluate with.
+        pipeline: VanillaPipeline to evaluate with.
     """
     if normal_method == "model_output":
         CONSOLE.print("Checking that the pipeline has a normal output.")

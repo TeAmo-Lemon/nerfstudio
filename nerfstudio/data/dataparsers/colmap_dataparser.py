@@ -38,7 +38,7 @@ from nerfstudio.data.utils.dataparsers_utils import (
     get_train_eval_split_fraction,
     get_train_eval_split_interval,
 )
-from nerfstudio.process_data.colmap_utils import parse_colmap_camera_params
+from nerfstudio.data.colmap_utils import parse_colmap_camera_params
 from nerfstudio.utils.rich_utils import CONSOLE, status
 from nerfstudio.utils.scripts import run_command
 

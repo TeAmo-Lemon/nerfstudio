@@ -27,17 +27,17 @@ import torch
 import yaml
 
 from nerfstudio.engine.trainer import TrainerConfig
-from nerfstudio.pipelines.base_pipeline import Pipeline
+from nerfstudio.pipelines.base_pipeline import VanillaPipeline
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
-def eval_load_checkpoint(config: TrainerConfig, pipeline: Pipeline) -> Tuple[Path, int]:
+def eval_load_checkpoint(config: TrainerConfig, pipeline: VanillaPipeline) -> Tuple[Path, int]:
     ## TODO: ideally eventually want to get this to be the same as whatever is used to load train checkpoint too
     """Helper function to load checkpointed pipeline
 
     Args:
         config (DictConfig): Configuration of pipeline to load
-        pipeline (Pipeline): Pipeline instance of which to load weights
+        pipeline (VanillaPipeline): VanillaPipeline instance of which to load weights
     Returns:
         A tuple of the path to the loaded checkpoint and the step at which it was saved.
     """
@@ -69,7 +69,7 @@ def eval_setup(
     eval_num_rays_per_chunk: Optional[int] = None,
     test_mode: Literal["test", "val", "inference"] = "test",
     update_config_callback: Optional[Callable[[TrainerConfig], TrainerConfig]] = None,
-) -> Tuple[TrainerConfig, Pipeline, Path, int]:
+) -> Tuple[TrainerConfig, VanillaPipeline, Path, int]:
     """Shared setup for loading a saved pipeline for evaluation.
 
     Args:
@@ -106,7 +106,7 @@ def eval_setup(
     # setup pipeline (which includes the DataManager)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pipeline = config.pipeline.setup(device=device, test_mode=test_mode)
-    assert isinstance(pipeline, Pipeline)
+    assert isinstance(pipeline, VanillaPipeline)
     pipeline.eval()
 
     # load checkpointed information

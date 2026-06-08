@@ -291,6 +291,11 @@ def extract_dino_features_for_images(
             )
         )
 
+    # Free the DINOv2 model from GPU memory — it is no longer needed after patch extraction.
+    del model
+    if resolved_device.type == "cuda":
+        torch.cuda.empty_cache()
+
     if len(pca_state) == 0:
         print("[INFO] Fitting PCA...")
         pca, effective_dim = _fit_pca(records, feature_dim)

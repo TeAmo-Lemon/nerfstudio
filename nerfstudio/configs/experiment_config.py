@@ -64,7 +64,7 @@ class ExperimentConfig(InstantiateConfig):
     )
     """Dictionary of optimizer groups and their schedulers"""
     vis: Literal[
-        "viewer", "wandb", "tensorboard", "comet", "viewer+wandb", "viewer+tensorboard", "viewer+comet", "viewer_legacy"
+        "viewer", "wandb", "tensorboard", "comet", "viewer+wandb", "viewer+tensorboard", "viewer+comet"
     ] = "viewer"
     """Which visualizer to use."""
     data: Optional[Path] = None
@@ -75,10 +75,6 @@ class ExperimentConfig(InstantiateConfig):
     """Relative path to save all checkpoints."""
     load_scheduler: bool = True
     """Whether to load the scheduler state_dict to resume training, if it exists."""
-
-    def is_viewer_legacy_enabled(self) -> bool:
-        """Checks if the legacy viewer is enabled."""
-        return "viewer_legacy" == self.vis
 
     def is_viewer_enabled(self) -> bool:
         """Checks if the viewer is enabled."""
@@ -115,7 +111,8 @@ class ExperimentConfig(InstantiateConfig):
         # check the experiment and method names
         assert self.method_name is not None, "Please set method name in config or via the cli"
         self.set_experiment_name()
-        return Path(f"{self.output_dir}/{self.experiment_name}/{self.method_name}/{self.timestamp}")
+        self.set_timestamp()
+        return Path(f"{self.output_dir}/{self.method_name}/{self.experiment_name}/{self.timestamp}")
 
     def get_checkpoint_dir(self) -> Path:
         """Retrieve the checkpoint directory"""

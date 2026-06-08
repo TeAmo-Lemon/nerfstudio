@@ -880,3 +880,18 @@ def fisheye624_unproject(coords: torch.Tensor, distortion_params: torch.Tensor) 
     dirs[..., 1] = -dirs[..., 1]
     dirs[..., 2] = -dirs[..., 2]
     return dirs
+
+
+def three_js_perspective_camera_focal_length(fov: float, image_height: int) -> float:
+    """Returns the focal length of a three.js perspective camera.
+
+    Args:
+        fov: the field of view of the camera in degrees.
+        image_height: the height of the image in pixels.
+    """
+    if fov is None:
+        print("Warning: fov is None, using default value")
+        return 50
+    pp_h = image_height / 2.0
+    focal_length = pp_h / np.tan(fov * (np.pi / 180.0) / 2.0)
+    return focal_length

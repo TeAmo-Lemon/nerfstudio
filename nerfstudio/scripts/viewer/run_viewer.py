@@ -29,11 +29,10 @@ import tyro
 
 from nerfstudio.configs.base_config import ViewerConfig
 from nerfstudio.engine.trainer import TrainerConfig
-from nerfstudio.pipelines.base_pipeline import Pipeline
+from nerfstudio.pipelines.base_pipeline import VanillaPipeline
 from nerfstudio.utils import writer
 from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.viewer.viewer import Viewer as ViewerState
-from nerfstudio.viewer_legacy.server.viewer_state import ViewerLegacyState
 
 
 @dataclass
@@ -55,7 +54,7 @@ class RunViewer:
     """Path to config YAML file."""
     viewer: ViewerConfigWithoutNumRays = field(default_factory=ViewerConfigWithoutNumRays)
     """Viewer configuration"""
-    vis: Literal["viewer", "viewer_legacy"] = "viewer"
+    vis: Literal["viewer"] = "viewer"
     """Type of viewer"""
 
     def main(self) -> None:
@@ -79,12 +78,12 @@ class RunViewer:
         """
 
 
-def _start_viewer(config: TrainerConfig, pipeline: Pipeline, step: int):
+def _start_viewer(config: TrainerConfig, pipeline: VanillaPipeline, step: int):
     """Starts the viewer
 
     Args:
         config: Configuration of pipeline to load
-        pipeline: Pipeline instance of which to load weights
+        pipeline: VanillaPipeline instance of which to load weights
         step: Step at which the pipeline was saved
     """
     base_dir = config.load_dir.parent if config.load_dir is not None else config.get_base_dir()
@@ -92,25 +91,15 @@ def _start_viewer(config: TrainerConfig, pipeline: Pipeline, step: int):
     banner_messages = None
     viewer_state = None
     viewer_callback_lock = Lock()
-    if config.vis == "viewer_legacy":
-        viewer_state = ViewerLegacyState(
-            config.viewer,
-            log_filename=viewer_log_path,
-            datapath=pipeline.datamanager.get_datapath(),
-            pipeline=pipeline,
-            train_lock=viewer_callback_lock,
-        )
-        banner_messages = [f"Legacy viewer at: {viewer_state.viewer_url}"]
-    if config.vis == "viewer":
-        viewer_state = ViewerState(
-            config.viewer,
-            log_filename=viewer_log_path,
-            datapath=pipeline.datamanager.get_datapath(),
-            pipeline=pipeline,
-            share=config.viewer.make_share_url,
-            train_lock=viewer_callback_lock,
-        )
-        banner_messages = viewer_state.viewer_info
+    viewer_state = ViewerState(
+        config.viewer,
+        log_filename=viewer_log_path,
+        datapath=pipeline.datamanager.get_datapath(),
+        pipeline=pipeline,
+        share=config.viewer.make_share_url,
+        train_lock=viewer_callback_lock,
+    )
+    banner_messages = viewer_state.viewer_info
 
     # We don't need logging, but writer.GLOBAL_BUFFER needs to be populated
     config.logging.local_writer.enable = False
@@ -122,8 +111,6 @@ def _start_viewer(config: TrainerConfig, pipeline: Pipeline, step: int):
         train_state="completed",
         eval_dataset=pipeline.datamanager.eval_dataset,
     )
-    if isinstance(viewer_state, ViewerLegacyState):
-        viewer_state.viser_server.set_training_state("completed")
     viewer_state.update_scene(step=step)
     while True:
         time.sleep(0.01)

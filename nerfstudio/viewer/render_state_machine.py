@@ -32,8 +32,7 @@ from nerfstudio.model_components.renderers import background_color_override_cont
 from nerfstudio.models.splatfacto import SplatfactoModel
 from nerfstudio.utils import colormaps, writer
 from nerfstudio.utils.writer import GLOBAL_BUFFER, EventName, TimeWriter
-from nerfstudio.viewer.utils import CameraState, get_camera
-from nerfstudio.viewer_legacy.server import viewer_utils
+from nerfstudio.viewer.utils import CameraState, IOChangeException, SetTrace, get_camera
 
 if TYPE_CHECKING:
     from nerfstudio.viewer.viewer import Viewer
@@ -162,12 +161,12 @@ class RenderStateMachine(threading.Thread):
                             )
                         with background_color_override_context(
                             background_color
-                        ), torch.no_grad(), viewer_utils.SetTrace(self.check_interrupt):
+                        ), torch.no_grad(), SetTrace(self.check_interrupt):
                             outputs = self.viewer.get_model().get_outputs_for_camera(camera, obb_box=obb)
                     else:
-                        with torch.no_grad(), viewer_utils.SetTrace(self.check_interrupt):
+                        with torch.no_grad(), SetTrace(self.check_interrupt):
                             outputs = self.viewer.get_model().get_outputs_for_camera(camera, obb_box=obb)
-                except viewer_utils.IOChangeException:
+                except IOChangeException:
                     raise
                 finally:
                     if was_training:
@@ -227,7 +226,7 @@ class RenderStateMachine(threading.Thread):
             self.state = self.transitions[self.state][action.action]
             try:
                 outputs = self._render_img(action.camera_state)
-            except viewer_utils.IOChangeException:
+            except IOChangeException:
                 # if we got interrupted, don't send the output to the viewer
                 continue
             self._send_output_to_viewer(outputs, static_render=(action.action in ["static", "step"]))
@@ -239,7 +238,7 @@ class RenderStateMachine(threading.Thread):
         if event == "line":
             if self.interrupt_render_flag:
                 self.interrupt_render_flag = False
-                raise viewer_utils.IOChangeException
+                raise IOChangeException
         return self.check_interrupt
 
     def _send_output_to_viewer(self, outputs: Dict[str, Any], static_render: bool = True):

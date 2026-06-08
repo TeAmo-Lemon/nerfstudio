@@ -37,7 +37,7 @@ data_root/
 最基础的训练命令：
 
 ```bash
-python train.py -s /path/to/data_root -m outputs/experiment_name
+python train.py -s /path/to/data_root -m outputs
 ```
 
 常用参数：
@@ -59,7 +59,7 @@ python train.py -s /path/to/data_root -m outputs/experiment_name
 ### 示例
 
 关闭 viewer 的普通训练：
-
+ python train.py -s /mnt/data2/experiments/3dgs/mipnerf360/bicycle/ -m /mnt/data2/experiments/3dgs/nerfstudio/output
 ```bash
 python train.py \
 	-s /path/to/data_root \
@@ -78,7 +78,7 @@ python train.py \
 
 ## DINO 特征
 
-当使用 `dino-splatfacto` 时，脚本会在训练前检查 DINO 特征是否齐全；缺失时会自动提取并保存到默认目录 `<model-path>/dino_features/`。你也可以手动指定目录：
+当使用 `dino-splatfacto` 时，脚本会在训练前检查 DINO 特征是否齐全；缺失时会自动提取并保存到默认目录 `<output_dir>/<method_name>/<scene_name>/dino_features/`。你也可以手动指定目录：
 
 ```bash
 python train.py \
@@ -102,7 +102,13 @@ python scripts/extract_dino_features.py \
 
 ## 输出目录
 
-训练脚本会在 `-m / --model-path` 指定的目录下写入：
+训练脚本会在 `-m / --model-path` 指定的目录下按以下结构写入：
+
+- `<output_dir>/<method_name>/<scene_name>/<timestamp>/`
+
+其中 `method_name` 取自 `--pipeline`，当前支持 `splatfacto`、`dino-splatfacto`；`scene_name` 默认取数据集根目录名，比如 `garden`、`flower`、`bicycle`。
+
+该运行目录下会写入：
 
 - `config.yml`：本次训练使用的配置
 - `dataparser_transforms.json`：数据解析器导出的相机变换

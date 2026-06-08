@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import socket
+import sys
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, List, Literal, Optional, Tuple, Type, Union
@@ -25,7 +27,48 @@ from torch import nn
 
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.scene_box import SceneBox
-from nerfstudio.models.base_model import Model
+from nerfstudio.models.splatfacto import SplatfactoModel
+
+
+class IOChangeException(Exception):
+    """Basic camera exception to interrupt viewer."""
+
+
+class SetTrace:
+    """Basic trace function."""
+
+    def __init__(self, func):
+        self.func = func
+
+    def __enter__(self):
+        sys.settrace(self.func)
+        return self
+
+    def __exit__(self, ext_type, exc_value, traceback):
+        sys.settrace(None)
+
+
+def is_port_open(port: int) -> bool:
+    """Returns True if the port is open."""
+    try:
+        sock = socket.socket()
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _ = sock.bind(("", port))
+        sock.close()
+        return True
+    except OSError:
+        return False
+
+
+def get_free_port(default_port: Optional[int] = None) -> int:
+    """Returns a free port on the local machine. Try to use default_port if possible."""
+    if default_port is not None:
+        if is_port_open(default_port):
+            return default_port
+    sock = socket.socket()
+    sock.bind(("", 0))
+    port = sock.getsockname()[1]
+    return port
 
 
 @dataclass
@@ -86,7 +129,7 @@ def get_camera(
 
 
 def update_render_aabb(
-    crop_viewport: bool, crop_min: Tuple[float, float, float], crop_max: Tuple[float, float, float], model: Model
+    crop_viewport: bool, crop_min: Tuple[float, float, float], crop_max: Tuple[float, float, float], model: SplatfactoModel
 ):
     """
     update the render aabb box for the viewer:
