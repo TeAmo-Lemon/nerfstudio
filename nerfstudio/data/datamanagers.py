@@ -9,7 +9,10 @@ Datamanager.
 
 from __future__ import annotations
 
+import importlib.util
+import os
 import random
+import sys
 from abc import abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -547,10 +550,34 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
         def undistort_idx(idx: int) -> Dict[str, torch.Tensor]:
             data = dataset.get_data(idx, image_type=self.config.cache_images_type)
             camera = dataset.cameras[idx].reshape(())
-            assert data["image"].shape[1] == camera.width.item() and data["image"].shape[0] == camera.height.item(), (
-                f"The size of image ({data['image'].shape[1]}, {data['image'].shape[0]}) loaded "
-                f"does not match the camera parameters ({camera.width.item(), camera.height.item()})"
-            )
+            # If the loaded image resolution doesn't match the camera intrinsics, adjust the camera
+            # intrinsics to match the actually loaded image instead of failing. This can happen when
+            # images on disk have been externally downscaled / resaved compared to COLMAP camera params.
+            img_h = int(data["image"].shape[0])
+            img_w = int(data["image"].shape[1])
+            cam_w = int(camera.width.item())
+            cam_h = int(camera.height.item())
+            if img_w != cam_w or img_h != cam_h:
+                CONSOLE.print(
+                    f"[bold yellow]Warning: Loaded image resolution ({img_w}, {img_h}) does not match "
+                    f"camera resolution ({cam_w}, {cam_h}). Adjusting camera intrinsics to image size.[/bold yellow]"
+                )
+                # Scale intrinsics to the new resolution per-axis
+                # Use float ratios to adjust fx/fy/cx/cy appropriately.
+                try:
+                    scale_w = img_w / cam_w if cam_w != 0 else 1.0
+                    scale_h = img_h / cam_h if cam_h != 0 else 1.0
+                    dataset.cameras.fx[idx] = float(dataset.cameras.fx[idx].item() * scale_w)
+                    dataset.cameras.fy[idx] = float(dataset.cameras.fy[idx].item() * scale_h)
+                    dataset.cameras.cx[idx] = float(dataset.cameras.cx[idx].item() * scale_w)
+                    dataset.cameras.cy[idx] = float(dataset.cameras.cy[idx].item() * scale_h)
+                    dataset.cameras.width[idx] = img_w
+                    dataset.cameras.height[idx] = img_h
+                    # Refresh local camera reference to reflect updates
+                    camera = dataset.cameras[idx].reshape(())
+                except Exception:
+                    CONSOLE.print("[bold red]Failed to adjust camera intrinsics automatically.[/bold red]")
+                    raise
             if camera.distortion_params is None or torch.all(camera.distortion_params == 0):
                 return data
             K = camera.get_intrinsics_matrices().numpy()
@@ -747,6 +774,73 @@ class FullImageDatamanager(DataManager, Generic[TDataset]):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# DINO feature extraction helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _ensure_dino_features(
+    source_path: Path,
+    dino_feature_dir: Path,
+    feature_dim: int,
+    device: str,
+) -> None:
+    """Auto-extract DINO features if the feature file doesn't exist or is incomplete."""
+    from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
+
+    # scripts/ isn't a package — load extract_dino_features.py by path
+    _project_root = Path(__file__).resolve().parent.parent.parent  # repo root from nerfstudio/data/
+    _extract_script = _project_root / "scripts" / "extract_dino_features.py"
+    _spec = importlib.util.spec_from_file_location("_extract_dino_features", _extract_script)
+    _extract_module = importlib.util.module_from_spec(_spec)
+    sys.modules["_extract_dino_features"] = _extract_module
+    _spec.loader.exec_module(_extract_module)
+
+    # Minimal dataparser setup to discover image paths
+    dataparser_cfg = ColmapDataParserConfig(data=source_path, load_3D_points=True)
+    dataparser = dataparser_cfg.setup()
+    train_outputs = dataparser.get_dataparser_outputs(split="train")
+    eval_outputs = dataparser.get_dataparser_outputs(split="val")
+
+    all_images = sorted(set(list(train_outputs.image_filenames) + list(eval_outputs.image_filenames)))
+    if len(all_images) == 0:
+        return
+
+    # Compute image_root — same logic as DinoInputDataset
+    image_parent_paths = [str(p.parent) for p in all_images]
+    image_root = Path(os.path.commonpath(image_parent_paths))
+
+    output_file = _extract_module._resolve_output_file(dino_feature_dir)
+
+    needs_extraction = not output_file.exists()
+    if not needs_extraction:
+        try:
+            existing, _ = _extract_module._load_existing_payload(output_file, feature_dim)
+            for img_path in all_images:
+                try:
+                    key = img_path.relative_to(image_root).with_suffix(".pt").as_posix()
+                except ValueError:
+                    needs_extraction = True
+                    break
+                if key not in existing:
+                    needs_extraction = True
+                    break
+        except Exception:
+            needs_extraction = True
+
+    if needs_extraction:
+        CONSOLE.log(f"[bold yellow]DINO features missing or incomplete, auto-extracting to {output_file}...")
+        saved, skipped = _extract_module.extract_dino_features_for_images(
+            image_paths=all_images,
+            input_dir=image_root,
+            output_dir=dino_feature_dir,
+            feature_dim=feature_dim,
+            device=device,
+            skip_existing=True,
+        )
+        CONSOLE.log(f"DINO feature extraction done: saved={saved}, skipped={skipped}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # DinoDatamanager
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -761,6 +855,36 @@ class DinoDatamanagerConfig(FullImageDatamanagerConfig):
 
 class DinoDatamanager(FullImageDatamanager[DinoInputDataset]):
     """Full-image datamanager that carries precomputed DINO feature maps in each batch."""
+
+    def __init__(
+        self,
+        config: DinoDatamanagerConfig,
+        device: Union[torch.device, str] = "cpu",
+        test_mode: Literal["test", "val", "inference"] = "val",
+        world_size: int = 1,
+        local_rank: int = 0,
+        **kwargs,
+    ):
+        # Auto-extract DINO features BEFORE parent init creates datasets
+        dino_feature_dir = (
+            Path(config.dino_features_dir)
+            if config.dino_features_dir is not None
+            else Path(config.dataparser.data) / "dino_features"
+        )
+        _ensure_dino_features(
+            source_path=Path(config.dataparser.data),
+            dino_feature_dir=dino_feature_dir,
+            feature_dim=config.dino_feature_dim,
+            device=str(device),
+        )
+        super().__init__(
+            config=config,
+            device=device,
+            test_mode=test_mode,
+            world_size=world_size,
+            local_rank=local_rank,
+            **kwargs,
+        )
 
     def _resolve_dino_feature_dir(self) -> Path:
         if self.config.dino_features_dir is not None:

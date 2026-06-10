@@ -39,72 +39,6 @@ from nerfstudio.viewer.viewer import Viewer
 torch.backends.cudnn.benchmark = True  # type: ignore
 
 
-def _ensure_dino_features(
-    source_path: Path,
-    dino_feature_dir: Path,
-    feature_dim: int,
-    device: str,
-) -> None:
-    """Auto-extract DINO features if the feature file doesn't exist or is incomplete."""
-    import importlib.util
-    import os
-    import sys
-
-    from nerfstudio.data.dataparsers.colmap_dataparser import ColmapDataParserConfig
-
-    # scripts/ isn't a package — load extract_dino_features.py by path
-    _project_root = Path(__file__).resolve().parent  # project root (where train.py lives)
-    _extract_script = _project_root / "scripts" / "extract_dino_features.py"
-    _spec = importlib.util.spec_from_file_location("_extract_dino_features", _extract_script)
-    _extract_module = importlib.util.module_from_spec(_spec)
-    sys.modules["_extract_dino_features"] = _extract_module
-    _spec.loader.exec_module(_extract_module)
-
-    # Minimal dataparser setup to discover image paths
-    dataparser_cfg = ColmapDataParserConfig(data=source_path, load_3D_points=True)
-    dataparser = dataparser_cfg.setup()
-    train_outputs = dataparser.get_dataparser_outputs(split="train")
-    eval_outputs = dataparser.get_dataparser_outputs(split="val")
-
-    all_images = sorted(set(list(train_outputs.image_filenames) + list(eval_outputs.image_filenames)))
-    if len(all_images) == 0:
-        return
-
-    # Compute image_root — same logic as DinoInputDataset
-    image_parent_paths = [str(p.parent) for p in all_images]
-    image_root = Path(os.path.commonpath(image_parent_paths))
-
-    output_file = _extract_module._resolve_output_file(dino_feature_dir)
-
-    needs_extraction = not output_file.exists()
-    if not needs_extraction:
-        try:
-            existing, _ = _extract_module._load_existing_payload(output_file, feature_dim)
-            for img_path in all_images:
-                try:
-                    key = img_path.relative_to(image_root).with_suffix(".pt").as_posix()
-                except ValueError:
-                    needs_extraction = True
-                    break
-                if key not in existing:
-                    needs_extraction = True
-                    break
-        except Exception:
-            needs_extraction = True
-
-    if needs_extraction:
-        CONSOLE.log(f"[bold yellow]DINO features missing or incomplete, auto-extracting to {output_file}...")
-        saved, skipped = _extract_module.extract_dino_features_for_images(
-            image_paths=all_images,
-            input_dir=image_root,
-            output_dir=dino_feature_dir,
-            feature_dim=feature_dim,
-            device=device,
-            skip_existing=True,
-        )
-        CONSOLE.log(f"DINO feature extraction done: saved={saved}, skipped={skipped}")
-
-
 def _setup_viewer(
     config: TrainerConfig,
     output_dir: Path,
@@ -493,7 +427,13 @@ def _run_train_loop(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Direct Splatfacto training entrypoint.")
     parser.add_argument("-s", "--source-path", type=Path, required=True, help="COLMAP dataset root.")
-    parser.add_argument("-m", "--model-path", type=Path, required=True, help="Output directory for config/checkpoints.")
+    parser.add_argument(
+        "-m",
+        "--model-path",
+        type=Path,
+        default=Path("/mnt/data2/experiments/3dgs/nerfstudio/output"),
+        help="Output directory for config/checkpoints.",
+    )
     parser.add_argument(
         "--pipeline",
         choices=["splatfacto", "dino-splatfacto"],
@@ -549,15 +489,6 @@ def main() -> None:
     _set_random_seed(config.machine.seed)
     _save_config(config, output_dir)
     CONSOLE.log(f"Saving checkpoints to: {checkpoint_dir}")
-
-    if args.pipeline == "dino-splatfacto":
-        dino_dm_config = cast(Any, config.pipeline.datamanager)
-        _ensure_dino_features(
-            source_path=args.source_path.resolve(),
-            dino_feature_dir=dino_dm_config.dino_features_dir,
-            feature_dim=dino_dm_config.dino_feature_dim,
-            device=args.device,
-        )
 
     train_lock = Lock()
     session_state = SessionState(

@@ -253,19 +253,39 @@ class SplatfactoModel(nn.Module):
         return self.get_outputs(ray_bundle)
 
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
-        """Render Gaussian Splats for the given camera(s)."""
+        """为给定的相机渲染高斯泼溅图像。
+
+        完整流程:
+        1. 相机类型检查
+        2. 训练时对相机外参施加优化偏移量（camera optimizer）
+        3. 评估时按裁剪框（crop_box）过滤高斯球，若为空则返回空白图
+        4. 选出活跃的高斯基元参数（位置、缩放、旋转、颜色、不透明度）
+        5. 将 SH 系数拼接为颜色特征（DC + 高阶带）
+        6. 按下采样因子缩放相机分辨率 → 计算视图矩阵 V 和内参 K
+        7. 选择渲染模式：训练时可仅输出 RGB（节省计算），否则输出 RGB+ED（额外深度通道）
+        8. 随训练步数渐进提升 SH 阶数（sh_degree warm-up）
+        9. 调用 CUDA rasterization 做前向泼溅渲染
+        10. 训练时执行策略的 pre-backward 钩子（如 densify/prune 梯度统计）
+        11. Alpha 合成：RGB = 渲染颜色 + (1 - alpha) * 背景色
+        12. 可选应用双边网格（bilateral grid）微调颜色
+        13. 提取深度图（若有 ED 通道），对无高斯的区域用最大深度填充
+        14. 返回 {"rgb", "depth", "accumulation", "background"}
+        """
+        # 步骤 1: 确保输入是 Cameras 对象
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
 
+        # 步骤 2: 训练时对相机外参施加可学习的微小偏移（pose refinement）
         if self.training:
             assert camera.shape[0] == 1, "Only one camera at a time"
             optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera)
         else:
             optimized_camera_to_world = camera.camera_to_worlds
 
+        # 步骤 3: 评估时按裁剪框过滤，减少不必要的渲染计算
         if self.crop_box is not None and not self.training:
-            crop_ids = self.crop_box.within(self.means).squeeze()
+            crop_ids = self.crop_box.within(self.means).squeeze()  # 判断每个高斯球心是否在框内
             if crop_ids.sum() == 0:
                 return self.get_empty_outputs(
                     int(camera.width.item()), int(camera.height.item()), self.background_color
@@ -273,6 +293,7 @@ class SplatfactoModel(nn.Module):
         else:
             crop_ids = None
 
+        # 步骤 4: 选出需要参与渲染的高斯参数（被 crop 的取子集，否则取全部）
         if crop_ids is not None:
             opacities_crop = self.opacities[crop_ids]
             means_crop = self.means[crop_ids]
@@ -288,83 +309,97 @@ class SplatfactoModel(nn.Module):
             scales_crop = self.scales
             quats_crop = self.quats
 
+        # 步骤 5: 拼接 SH 系数 — DC（第 0 阶）+ 高阶带 → 每个球有 (1 + sh_degree)² 个 RGB 分量
         colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
 
+        # 步骤 6: 计算下采样后的视图矩阵 V、内参矩阵 K、输出分辨率 (W, H)
         camera_scale_fac = self._get_downscale_factor()
         camera.rescale_output_resolution(1 / camera_scale_fac)
-        viewmat = get_viewmat(optimized_camera_to_world)
-        K = camera.get_intrinsics_matrices().cuda()
+        viewmat = get_viewmat(optimized_camera_to_world)  # world→camera 的 4×4 外参矩阵
+        K = camera.get_intrinsics_matrices().cuda()        # 3×3 内参矩阵
         W, H = int(camera.width.item()), int(camera.height.item())
         self.last_size = (H, W)
-        camera.rescale_output_resolution(camera_scale_fac)  # type: ignore
+        camera.rescale_output_resolution(camera_scale_fac)  # 恢复原始分辨率，避免副作用
 
         if self.config.rasterize_mode not in ["antialiased", "classic"]:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
+        # 步骤 7: 选择渲染模式 — RGB+ED 额外输出期望深度（Expected Depth）通道，用于深度损失或可视化
         if self.config.output_depth_during_training or not self.training:
             render_mode = "RGB+ED"
         else:
             render_mode = "RGB"
 
+        # 步骤 8: SH 阶数渐进式 warm-up — 随训练步数从 0 阶逐步提升到目标阶数，稳定训练初期
         if self.config.sh_degree > 0:
             sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
         else:
-            colors_crop = torch.sigmoid(colors_crop).squeeze(1)
+            colors_crop = torch.sigmoid(colors_crop).squeeze(1)  # 无 SH：直接 sigmoid 得到 RGB
             sh_degree_to_use = None
 
+        # 步骤 9: CUDA 光栅化 — 将 3D 高斯投影到屏幕空间，按深度排序后 alpha-blend
         render, alpha, self.info = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
-            means=means_crop,
-            quats=quats_crop,
-            scales=torch.exp(scales_crop),
-            opacities=torch.sigmoid(opacities_crop).squeeze(-1),
-            colors=colors_crop,
-            viewmats=viewmat,
-            Ks=K,
-            width=W,
-            height=H,
-            packed=False,
-            near_plane=0.01,
-            far_plane=1e10,
-            render_mode=render_mode,
-            sh_degree=sh_degree_to_use,
-            sparse_grad=False,
+            means=means_crop,                          # 球心位置 (N, 3)
+            quats=quats_crop,                          # 旋转四元数 (N, 4)
+            scales=torch.exp(scales_crop),             # 缩放因子，exp 保证正值
+            opacities=torch.sigmoid(opacities_crop).squeeze(-1),  # 不透明度，sigmoid 压到 [0,1]
+            colors=colors_crop,                        # RGB 颜色（可能含 SH 系数）
+            viewmats=viewmat,                          # 视图矩阵
+            Ks=K,                                      # 内参矩阵
+            width=W,                                   # 输出图像宽度
+            height=H,                                  # 输出图像高度
+            packed=False,                              # 单相机模式，非多相机打包
+            near_plane=0.01,                           # 近裁剪面
+            far_plane=1e10,                            # 远裁剪面
+            render_mode=render_mode,                   # "RGB" 或 "RGB+ED"
+            sh_degree=sh_degree_to_use,                # 当前激活的 SH 阶数
+            sparse_grad=False,                         # 稠密梯度（对所有投影像素回传）
             absgrad=self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
-            rasterize_mode=self.config.rasterize_mode,
+            rasterize_mode=self.config.rasterize_mode, # "classic" 或 "antialiased"
         )
+        # 步骤 10: 训练时执行策略钩子 — 收集梯度统计，用于后续 densify/prune 决策
         if self.training:
             self.strategy.step_pre_backward(
                 self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
             )
-        alpha = alpha[:, ...]
+        alpha = alpha[:, ...]  # 确保 alpha 维度一致
 
+        # 步骤 11: Alpha 合成 — 渲染色与背景色按透射率混合
         background = self._get_background_color()
         rgb = render[:, ..., :3] + (1 - alpha) * background
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
+        # 步骤 12: 可选应用双边网格 — 在高分辨率特征网格上做颜色微调，提升细节
         if self.config.use_bilateral_grid and self.training:
             if camera.metadata is not None and "cam_idx" in camera.metadata:
                 rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], H, W)
 
+        # 步骤 13: 提取深度通道 — 若无高斯覆盖的区域，用场景最大深度填充（避免黑色空洞）
         if render_mode == "RGB+ED":
             depth_im = render[:, ..., 3:4]
             depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
         else:
             depth_im = None
 
+        # 评估时若背景是单色 (3,)，广播到图像尺寸以便后续拼接
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
+        # 步骤 14: 返回渲染结果字典
         return {
-            "rgb": rgb.squeeze(0),  # type: ignore
-            "depth": depth_im,  # type: ignore
-            "accumulation": alpha.squeeze(0),  # type: ignore
-            "background": background,  # type: ignore
+            "rgb": rgb.squeeze(0),          # (H, W, 3) — 渲染 RGB
+            "depth": depth_im,              # (H, W, 1) 或 None — 期望深度
+            "accumulation": alpha.squeeze(0),  # (H, W, 1) — 透射率/累积 alpha
+            "background": background,        # (3,) 或 (H, W, 3) — 使用的背景色
         }
 
     # ── training loss & metrics ──────────────────────────────────────────
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         """Compute L1 + SSIM + regularization losses."""
+        # ─────────────────────────────────────────────────────
+        # 1) 准备：合成带背景的 GT 图与预测图，并可选应用掩码
+        # ─────────────────────────────────────────────────────
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
 
@@ -374,9 +409,15 @@ class SplatfactoModel(nn.Module):
             gt_img = gt_img * mask
             pred_img = pred_img * mask
 
+        # ─────────────────────────────────────────────────────
+        # 2) 基本像素损失：L1 与 SSIM
+        # ─────────────────────────────────────────────────────
         Ll1 = torch.abs(gt_img - pred_img).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
 
+        # ─────────────────────────────────────────────────────
+        # 3) 尺度正则化（按步长节流，每 10 步计算一次）
+        # ─────────────────────────────────────────────────────
         if self.config.use_scale_regularization and self.step % 10 == 0:
             scale_exp = torch.exp(self.scales)
             scale_reg = (
@@ -390,11 +431,17 @@ class SplatfactoModel(nn.Module):
         else:
             scale_reg = torch.tensor(0.0).to(self.device)
 
+        # ─────────────────────────────────────────────────────
+        # 4) 汇总损失字典（主损失 + 正则项）
+        # ─────────────────────────────────────────────────────
         loss_dict = {
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
             "scale_reg": scale_reg,
         }
 
+        # ─────────────────────────────────────────────────────
+        # 5) 策略相关的额外正则项（例如 MCMC 的不透明度/尺度正则）
+        # ─────────────────────────────────────────────────────
         if self.config.strategy == "mcmc":
             if self.config.mcmc_opacity_reg > 0.0:
                 loss_dict["mcmc_opacity_reg"] = (
@@ -405,11 +452,17 @@ class SplatfactoModel(nn.Module):
                     self.config.mcmc_scale_reg * torch.abs(torch.exp(self.gauss_params["scales"])).mean()
                 )
 
+        # ─────────────────────────────────────────────────────
+        # 6) 训练时的额外损失：相机优化、双边网格的 TV 正则
+        # ─────────────────────────────────────────────────────
         if self.training:
             self.camera_optimizer.get_loss_dict(loss_dict)
             if self.config.use_bilateral_grid:
                 loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
 
+        # ─────────────────────────────────────────────────────
+        # 完成：返回损失字典
+        # ─────────────────────────────────────────────────────
         return loss_dict
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
@@ -429,9 +482,15 @@ class SplatfactoModel(nn.Module):
 
     @torch.no_grad()
     def get_outputs_for_camera(self, camera: Cameras, obb_box: Optional[OrientedBox] = None) -> Dict[str, torch.Tensor]:
-        """Render a full image for the given camera (eval mode)."""
+        """为给定相机渲染完整图像（仅评估模式）。
+
+        对 get_outputs 的轻量封装，额外做了：
+        1. 设置裁剪框（crop_box），用于交互式查看器的框选渲染
+        2. 将相机移到模型所在设备
+        3. 整个调用在 torch.no_grad() 下执行，不构建计算图
+        """
         assert camera is not None, "must provide camera to gaussian model"
-        self.set_crop(obb_box)
+        self.set_crop(obb_box)  # 设置可能为 None 的裁剪框（None 即取消裁剪）
         return self.get_outputs(camera.to(self.device))  # type: ignore
 
     def get_image_metrics_and_images(
