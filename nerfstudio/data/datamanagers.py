@@ -840,6 +840,82 @@ def _ensure_dino_features(
         CONSOLE.log(f"DINO feature extraction done: saved={saved}, skipped={skipped}")
 
 
+def _ensure_style_primitives(
+    style_image_path: Path,
+    output_path: Path,
+    num_primitives: int,
+    device: str,
+) -> None:
+    """Extract style texture prototypes from a 2D style image via DINOv2 + K-Means.
+
+    Follows the Phase-2 decomposition in the architecture doc:
+    1. Extract DINOv2 patch-level features from the style image
+    2. L2-normalize and K-Means cluster into *num_primitives* prototypes
+    3. Save the L2-normalized prototypes to *output_path* as a .pt file
+
+    The saved tensor ``style_primitives.pt`` contains a dict with key
+    ``"prototypes"`` mapping to a ``(K, D)`` float32 tensor.
+    """
+    if output_path.exists():
+        CONSOLE.log(f"Style primitives already exist at {output_path}, skipping extraction.")
+        return
+
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image
+    from torchvision import transforms
+
+    target_device = torch.device(device if torch.cuda.is_available() else "cpu")
+    CONSOLE.log(f"[bold yellow]Extracting {num_primitives} style primitives from {style_image_path} ...")
+
+    # ── 1. Load DINOv2 ──────────────────────────────────────────────────────
+    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14").to(target_device)
+    model.eval()
+
+    # ── 2. Preprocess ───────────────────────────────────────────────────────
+    patch_size = 14
+    image_size = max(patch_size, (560 // patch_size) * patch_size)
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    img_pil = Image.open(style_image_path).convert("RGB")
+    img_tensor = transform(img_pil).unsqueeze(0).to(target_device)
+
+    # ── 3. Extract patch-level features ─────────────────────────────────────
+    with torch.no_grad():
+        features_dict = model.forward_features(img_tensor)
+        features = features_dict["x_norm_patchtokens"]  # (1, N, D)
+    features = features.squeeze(0)  # (N, D)
+    features_norm = F.normalize(features, p=2, dim=-1)
+
+    # ── 4. K-Means to get K prototypes ──────────────────────────────────────
+    # Pure-PyTorch K-Means (same algorithm as dino_mask.py)
+    N, D = features_norm.shape
+    indices = torch.randperm(N)[:num_primitives]
+    centroids = features_norm[indices].clone()
+
+    for _ in range(50):
+        dists = torch.cdist(features_norm, centroids, p=2)  # (N, K)
+        labels = torch.argmin(dists, dim=1)
+        new_centroids = []
+        for i in range(num_primitives):
+            mask = labels == i
+            if mask.sum() > 0:
+                new_centroids.append(features_norm[mask].mean(dim=0))
+            else:
+                new_centroids.append(features_norm[torch.randint(0, N, (1,))].squeeze(0))
+        centroids = torch.stack(new_centroids)
+
+    prototypes = F.normalize(centroids, p=2, dim=-1)
+
+    # ── 5. Save ─────────────────────────────────────────────────────────────
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"prototypes": prototypes.cpu()}, output_path)
+    CONSOLE.log(f"Style primitives saved to {output_path} (K={num_primitives}, D={D})")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DinoDatamanager
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -851,6 +927,9 @@ class DinoDatamanagerConfig(FullImageDatamanagerConfig):
     dino_features_dir: Optional[Path] = None
     dino_feature_dim: int = 16
     strict_dino_loading: bool = True
+    style_image_path: Optional[Path] = None
+    style_primitive_path: Optional[Path] = None
+    num_style_primitives: int = 5
 
 
 class DinoDatamanager(FullImageDatamanager[DinoInputDataset]):
@@ -877,6 +956,14 @@ class DinoDatamanager(FullImageDatamanager[DinoInputDataset]):
             feature_dim=config.dino_feature_dim,
             device=str(device),
         )
+        # Auto-extract style texture primitives (if a style image was provided)
+        if config.style_image_path is not None and config.style_primitive_path is not None:
+            _ensure_style_primitives(
+                style_image_path=config.style_image_path,
+                output_path=config.style_primitive_path,
+                num_primitives=config.num_style_primitives,
+                device=str(device),
+            )
         super().__init__(
             config=config,
             device=device,

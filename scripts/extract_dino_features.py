@@ -54,10 +54,10 @@ def _list_images(input_dir: Path, extensions: List[str]) -> List[Path]:
 
 
 def _resolve_device(device: str) -> torch.device:
-    if device == "cuda" and torch.cuda.is_available():
-        return torch.device("cuda")
-    if device == "mps" and torch.backends.mps.is_available():
-        return torch.device("mps")
+    if device.startswith("cuda") and torch.cuda.is_available():
+        return torch.device(device)
+    if device.startswith("mps") and torch.backends.mps.is_available():
+        return torch.device(device)
     return torch.device("cpu")
 
 

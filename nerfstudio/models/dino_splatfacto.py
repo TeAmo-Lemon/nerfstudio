@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type, Union, cast
 
 import torch
 import torch.nn.functional as F
 from gsplat.strategy import DefaultStrategy
-from gsplat.strategy.ops import duplicate, remove, split
+from gsplat.strategy.ops import duplicate, remove, reset_opa, split
 from torch.nn import Parameter
 
 try:
@@ -16,6 +17,8 @@ except ImportError:
 
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig, get_viewmat
+from nerfstudio.utils import writer as writer_module
+from nerfstudio.utils.rich_utils import CONSOLE
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -29,6 +32,7 @@ class DinoDefaultStrategy(DefaultStrategy):
     """DefaultStrategy variant that delegates densification ops to model methods."""
 
     model_ref: Optional["DinoSplatfactoModel"] = None
+    _last_densify_stats: Optional[Dict[str, int]] = None
 
     @torch.no_grad()
     def _grow_gs(
@@ -93,6 +97,52 @@ class DinoDefaultStrategy(DefaultStrategy):
 
         return n_prune
 
+    @torch.no_grad()
+    def step_post_backward(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        step: int,
+        info: Dict[str, Any],
+        packed: bool = False,
+    ) -> None:
+        """Override to suppress prints and capture densification stats."""
+        if step >= self.refine_stop_iter:
+            return
+
+        self._update_state(params, state, info, packed=packed)
+
+        if (
+            step > self.refine_start_iter
+            and step % self.refine_every == 0
+            and step % self.reset_every >= self.pause_refine_after_reset
+        ):
+            n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
+            n_prune = self._prune_gs(params, optimizers, state, step)
+
+            # store stats instead of printing
+            self._last_densify_stats = {
+                "n_dupli": n_dupli,
+                "n_split": n_split,
+                "n_prune": n_prune,
+                "total_gs": len(params["means"]),
+            }
+
+            state["grad2d"].zero_()
+            state["count"].zero_()
+            if self.refine_scale2d_stop_iter > 0:
+                state["radii"].zero_()
+            torch.cuda.empty_cache()
+
+        if step % self.reset_every == 0:
+            reset_opa(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                value=self.prune_opa * 2.0,
+            )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DinoSplatfactoModel
@@ -105,6 +155,8 @@ class DinoSplatfactoModelConfig(SplatfactoModelConfig):
     dino_feature_dim: int = 16
     dino_loss_weight: float = 1.0
     dino_loss_start_step: int = 3000
+    style_primitive_path: Optional[Path] = None
+    num_style_primitives: int = 8
 
 
 class DinoSplatfactoModel(SplatfactoModel):
@@ -125,6 +177,16 @@ class DinoSplatfactoModel(SplatfactoModel):
             0.01 * torch.randn(num_gaussians, cfg.dino_feature_dim, device=self.means.device)
         )
         self._override_default_strategy_with_dino_strategy()
+
+        # ── Load style texture primitives ──────────────────────────────────
+        if cfg.style_primitive_path is not None and cfg.style_primitive_path.exists():
+            payload = torch.load(cfg.style_primitive_path, map_location="cpu", weights_only=True)
+            primitives = payload.get("prototypes")
+            if primitives is not None:
+                self.register_buffer("style_primitives", primitives, persistent=False)
+                CONSOLE.log(f"Loaded style primitives: {tuple(primitives.shape)}")
+            else:
+                CONSOLE.log("[yellow]style_primitives.pt found but missing 'prototypes' key[/yellow]")
 
     # ── core rendering ───────────────────────────────────────────────────
 
@@ -256,6 +318,18 @@ class DinoSplatfactoModel(SplatfactoModel):
 
     def finish_train_step(self, step):
         super().finish_train_step(step)
+
+        # Report current GS count (post-densification)
+        writer_module.put_scalar("Total GSs", int(self.means.shape[0]), step)
+
+        # Report densification stats if available
+        s = self.strategy._last_densify_stats
+        if s is not None:
+            writer_module.put_scalar("GS Duplicated", s["n_dupli"], step)
+            writer_module.put_scalar("GS Split", s["n_split"], step)
+            writer_module.put_scalar("GS Pruned", s["n_prune"], step)
+            self.strategy._last_densify_stats = None
+
         if self.dino_features.shape[0] != self.means.shape[0]:
             raise RuntimeError(
                 "DINO feature count is out of sync with Gaussian count: "

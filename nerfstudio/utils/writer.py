@@ -33,6 +33,10 @@ from torch.utils.tensorboard import SummaryWriter
 from nerfstudio.configs import base_config as cfg
 from nerfstudio.utils.decorators import check_main_thread, decorate_all
 from nerfstudio.utils.printing import human_format
+from rich.live import Live
+from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeRemainingColumn
+from rich.text import Text
+
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
@@ -194,6 +198,13 @@ def setup_local_writer(config: cfg.LoggingConfig, max_iter: int, banner_messages
     GLOBAL_BUFFER["max_buffer_size"] = config.max_buffer_size
     GLOBAL_BUFFER["steps_per_log"] = config.steps_per_log
     GLOBAL_BUFFER["events"] = {}
+
+
+def close_local_writer() -> None:
+    """Close the local writer's progress bar."""
+    for writer in EVENT_WRITERS:
+        if isinstance(writer, LocalWriter):
+            writer.close()
 
 
 def is_initialized():
@@ -412,18 +423,60 @@ def _format_time(seconds):
 
 
 @decorate_all([check_main_thread])
+class _ProgressGroup:
+    """Renders a metrics line followed by a progress bar — drop-in for rich.group.Group."""
+
+    def __init__(self, metrics_text: Text, progress: Progress):
+        self.metrics_text = metrics_text
+        self.progress = progress
+
+    def __rich_console__(self, console, options):
+        yield self.metrics_text
+        yield self.progress
+
+
+@decorate_all([check_main_thread])
 class LocalWriter:
-    """Lightweight local writer that prints a single concise line per log step."""
+    """Lightweight local writer that renders a live progress bar during training."""
 
     def __init__(self, config: cfg.LocalWriterConfig, banner_messages: Optional[List[str]] = None):
         self.config = config
         self.stats_to_track = [name.value for name in config.stats_to_track]
+        self._live: Optional[Live] = None
+        self._progress: Optional[Progress] = None
+        self._task_id: Optional[int] = None
+        self._metrics_text: Optional[Text] = None
         if banner_messages:
             for message in banner_messages:
                 CONSOLE.log(message)
 
+    def _ensure_progress(self) -> None:
+        """Lazily create and start the two-line live display."""
+        if self._live is not None:
+            return
+
+        progress = Progress(
+            TextColumn("  "),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=CONSOLE,
+        )
+        task_id = progress.add_task("Training", total=GLOBAL_BUFFER["max_iter"])
+        metrics_text = Text("")
+
+        self._live = Live(
+            _ProgressGroup(metrics_text, progress),
+            console=CONSOLE,
+            refresh_per_second=0,  # manual refresh only — no background thread
+        )
+        self._live.start()
+        self._progress = progress
+        self._task_id = task_id
+        self._metrics_text = metrics_text
+
     def write_stats_log(self, step: int) -> None:
-        """Print a compact log line for the latest step."""
+        """Update the progress bar with latest metrics."""
         if step % GLOBAL_BUFFER["steps_per_log"] != 0:
             return
 
@@ -431,13 +484,32 @@ class LocalWriter:
         if not latest_map:
             return
 
-        progress = 100.0 * step / max(1, GLOBAL_BUFFER["max_iter"])
-        parts = [f"step={step}", f"{progress:.1f}%"]
+        self._ensure_progress()
+
+        parts = []
         for name in self.stats_to_track:
             if name not in latest_map:
                 continue
             parts.append(f"{self._short_name(name)}={self._format_value(name, latest_map[name])}")
-        CONSOLE.log(" | ".join(parts))
+        # Also show common training & densification metrics
+        for key in ["Train Loss", "PSNR", "GS Duplicated", "GS Split", "GS Pruned", "Total GSs", "GPU Memory (MB)"]:
+            if key in latest_map:
+                parts.append(f"{self._short_name(key)}={self._format_value(key, latest_map[key])}")
+        desc = " • ".join(parts) if parts else "Training"
+
+        self._metrics_text.plain = "  " + desc
+        self._progress.update(self._task_id, completed=step)
+        self._live.refresh()
+
+    def close(self) -> None:
+        """Stop the live display."""
+        if self._live is not None:
+            self._progress.update(self._task_id, completed=GLOBAL_BUFFER["max_iter"])
+            self._live.stop()
+            self._live = None
+            self._progress = None
+            self._task_id = None
+            self._metrics_text = None
 
     def write_config(self, name: str, config_dict: Dict[str, Any], step: int):
         """Local writer does not emit configs to terminal."""
@@ -460,6 +532,10 @@ class LocalWriter:
             "PSNR": "psnr",
             "Gaussian Count": "gaussians",
             "GPU Memory (MB)": "gpu_mb",
+            "Total GSs": "GSs",
+            "GS Duplicated": "↑dup",
+            "GS Split": "↓split",
+            "GS Pruned": "✕prune",
         }
         return aliases.get(name, name)
 

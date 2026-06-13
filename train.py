@@ -91,6 +91,9 @@ def _build_config(args: argparse.Namespace) -> TrainerConfig:
             if args.dino_feature_dir is not None
             else args.model_path.resolve() / method_name / scene_name / "dino_features"
         )
+        style_primitive_path = (
+            args.model_path.resolve() / method_name / scene_name / "style_primitives.pt"
+        )
         datamanager_config = DinoDatamanagerConfig(
             dataparser=ColmapDataParserConfig(data=args.source_path, load_3D_points=True),
             cache_images=args.data_device,
@@ -98,11 +101,16 @@ def _build_config(args: argparse.Namespace) -> TrainerConfig:
             dino_features_dir=dino_feature_dir,
             dino_feature_dim=args.dino_feature_dim,
             strict_dino_loading=True,
+            style_image_path=args.style_image,
+            style_primitive_path=style_primitive_path,
+            num_style_primitives=args.num_style_primitives,
         )
         model_config = DinoSplatfactoModelConfig(
             dino_feature_dim=args.dino_feature_dim,
             dino_loss_weight=args.dino_loss_weight,
             dino_loss_start_step=args.dino_loss_start_step,
+            style_primitive_path=style_primitive_path,
+            num_style_primitives=args.num_style_primitives,
         )
     else:
         datamanager_config = FullImageDatamanagerConfig(
@@ -251,6 +259,7 @@ def _setup_runtime_logging(config: TrainerConfig, output_dir: Path, banner_messa
 def _find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
     checkpoints = sorted(checkpoint_dir.glob("step-*.ckpt"))
     return checkpoints[-1] if checkpoints else None
+
 
 
 def _load_checkpoint(
@@ -412,6 +421,7 @@ def _run_train_loop(
         save_only_latest=config.save_only_latest_checkpoint,
     )
     writer.write_out_storage()
+    writer.close_local_writer()
     table = Table(title=None, show_header=False, box=box.MINIMAL, title_style=style.Style(bold=True))
     table.add_row("Config File", str(output_dir / "config.yml"))
     table.add_row("Checkpoint Directory", str(checkpoint_dir))
@@ -467,6 +477,24 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=3000,
         help="Enable DINO feature loss from this global training step.",
+    )
+    parser.add_argument(
+        "--style-image",
+        type=Path,
+        default="./datasets/style_images/14.jpg",
+        help="Path to a 2D style image for texture primitive decomposition.",
+    )
+    parser.add_argument(
+        "--style-primitive-path",
+        type=Path,
+        default=None,
+        help="Optional path to precomputed style_primitives.pt.",
+    )
+    parser.add_argument(
+        "--num-style-primitives",
+        type=int,
+        default=5,
+        help="Number of texture primitives (prototypes) to extract from the style image (K in K-means).",
     )
     return parser.parse_args()
 
@@ -540,6 +568,7 @@ def main() -> None:
     except KeyboardInterrupt:
         CONSOLE.print(traceback.format_exc())
     finally:
+        writer.close_local_writer()
         if viewer is not None:
             viewer.viser_server.stop()
         profiler.flush_profiler(config.logging)
